@@ -78,7 +78,17 @@ fine-tuning; zapisuje checkpoint do `ml/models/efficientnet_b0_ham10000.pt` i lo
 
 ### Frontend
 
-Nie zaimplementowany jeszcze — patrz sekcja Status.
+Wymaga uruchomionego backendu (patrz wyżej, domyślnie na `http://127.0.0.1:8000`).
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+- `http://localhost:3000/` — aplikacja (port ustawiony na sztywno w `vite.config.ts`, żeby
+  pasował do domyślnego `CORS_ORIGINS` backendu)
+- Adres backendu można nadpisać zmienną `VITE_API_BASE_URL` (domyślnie `http://127.0.0.1:8000`)
 
 ## Status
 
@@ -91,7 +101,9 @@ Projekt w fazie wczesnej implementacji.
 - 🔧 Backend (FastAPI + PostgreSQL) — w budowie: `GET /health`, `POST /predict` (inferencja +
   Grad-CAM + zapis przypadku), `GET/DELETE /cases` (historia przypadków), przesłane zdjęcia i
   nakładki Grad-CAM serwowane pod `/storage/uploads` i `/storage/gradcam`
-- ⬜ Frontend (React), konteneryzacja (Docker Compose), testy i dokumentacja
+- ✅ Frontend (Vite + React + TypeScript + Tailwind) — 3 ekrany MVP: upload + wynik z Grad-CAM
+  (`/`), historia przypadków (`/cases`), szczegół przypadku (`/cases/:id`)
+- ⬜ Konteneryzacja (Docker Compose), testy i dokumentacja
 
 Aktualna roadmapa: dataset → model bazowy → Grad-CAM → backend → frontend → konteneryzacja →
 testy i dokumentacja.
