@@ -9,14 +9,16 @@ actual computation graph, which is what a graph viewer needs.
 import torch
 
 from ml.src.model import build_model
-from ml.src.train import CHECKPOINT_PATH, DEVICE, MODELS_DIR
+from ml.src.registry import DEFAULT_VERSION, checkpoint_path
+from ml.src.train import DEVICE
 
-OUTPUT_PATH = MODELS_DIR / "efficientnet_b0_ham10000.onnx"
 
+def export(version: str = DEFAULT_VERSION):
+    # Same name as the checkpoint, just .onnx (+ .onnx.data with the weights).
+    output_path = checkpoint_path(version).with_suffix(".onnx")
 
-def export():
     model = build_model().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model.load_state_dict(torch.load(checkpoint_path(version), map_location=DEVICE))
     model.eval()
 
     # Shape must match dataloaders.py's INPUT_SIZE (224x224) and channel
@@ -27,11 +29,11 @@ def export():
     torch.onnx.export(
         model,
         dummy_input,
-        OUTPUT_PATH,
+        output_path,
         input_names=["image"],
         output_names=["logits"],
     )
-    print(f"Saved {OUTPUT_PATH}")
+    print(f"Saved {output_path}")
     print("Open it at https://netron.app (drag & drop -- runs entirely in your browser, nothing is uploaded)")
 
 

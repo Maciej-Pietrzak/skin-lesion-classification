@@ -16,7 +16,7 @@ personelowi medycznemu poprzez aplikację webową.
 
 - Python 3.12
 - Docker (baza danych PostgreSQL)
-- Wytrenowany checkpoint modelu pod `ml/models/efficientnet_b0_ham10000.pt` — plik jest
+- Wytrenowany checkpoint modelu pod `ml/models/efficientnet_b0_ham10000_v1.pt` — plik jest
   gitignorowany, więc trzeba go samodzielnie wytrenować (patrz sekcja
   [Trening modelu](#trening-modelu-opcjonalnie)) albo skopiować z innego źródła
 
@@ -72,9 +72,12 @@ pip install -r ml/requirements.txt
 ```
 
 Następnie: `ml/src/download_dataset.py` (pobiera HAM10000 z Kaggle) → `ml/src/split_dataset.py`
-(dzieli po `lesion_id`) → `python -m ml.src.train` (dwuetapowy trening: liniowa sonda, potem
-fine-tuning; zapisuje checkpoint do `ml/models/efficientnet_b0_ham10000.pt` i log epok do
-`ml/results/training_log.csv`).
+(dzieli po `lesion_id`) → `python -m ml.src.train --version v2` (dwuetapowy trening: liniowa
+sonda, potem fine-tuning; zapisuje checkpoint do `ml/models/efficientnet_b0_ham10000_v2.pt` i log
+epok do `ml/results/training_log.csv`) → `python -m ml.src.evaluate --version v2` (wyniki na
+zbiorze testowym trafiają do `ml/results/models.csv`). Każda wersja ma osobny plik i żaden trening
+nie nadpisuje wcześniejszego modelu; backend używa wersji wskazanej w `MODEL_CHECKPOINT_PATH`
+(`backend/.env`). Opis wszystkich wersji: [`ml/MODELS.md`](ml/MODELS.md).
 
 Wytrenowane wersje modelu (konfiguracja, wyniki na zbiorze testowym, znane słabości) są opisane
 w [`ml/MODELS.md`](ml/MODELS.md).

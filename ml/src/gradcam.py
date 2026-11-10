@@ -16,7 +16,8 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 from ml.src.dataloaders import IMAGENET_MEAN, IMAGENET_STD, build_transforms
 from ml.src.dataset import CLASSES, HAM10000Dataset
 from ml.src.model import build_model
-from ml.src.train import CHECKPOINT_PATH, DEVICE
+from ml.src.registry import DEFAULT_VERSION, checkpoint_path
+from ml.src.train import DEVICE
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs" / "gradcam"
 
@@ -44,11 +45,11 @@ def pick_one_index_per_class(test_ds: HAM10000Dataset) -> list[int]:
     return [seen[cls] for cls in CLASSES if cls in seen]
 
 
-def generate():
+def generate(version: str = DEFAULT_VERSION):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     model = build_model().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model.load_state_dict(torch.load(checkpoint_path(version), map_location=DEVICE))
     model.eval()
 
     # model.features[-1] is EfficientNet-B0's last conv block, the deepest

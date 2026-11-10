@@ -1,19 +1,26 @@
-"""Evaluates the trained checkpoint on the held-out test set."""
+"""Evaluates a trained model version on the held-out test set and records its
+results in ml/results/models.csv."""
+
+import argparse
+from datetime import datetime
 
 import torch
 from sklearn.metrics import classification_report, confusion_matrix
 
 from ml.src.dataloaders import get_dataloaders
 from ml.src.dataset import CLASSES
+from ml.src.metrics import compute_metrics
 from ml.src.model import build_model
-from ml.src.train import CHECKPOINT_PATH, DEVICE
+from ml.src.registry import DEFAULT_VERSION, checkpoint_path, upsert_model_row
+from ml.src.train import DEVICE
 
 
-def evaluate():
+def evaluate(version: str = DEFAULT_VERSION, notes: str = ""):
     _, _, test_dl = get_dataloaders(batch_size=32)
 
+    path = checkpoint_path(version)
     model = build_model().to(DEVICE)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    model.load_state_dict(torch.load(path, map_location=DEVICE))
     model.eval()
 
     all_preds, all_labels = [], []
@@ -24,11 +31,41 @@ def evaluate():
             all_preds.extend(outputs.argmax(dim=1).cpu().tolist())
             all_labels.extend(labels.tolist())
 
+    print(f"Model version: {version} ({path.name})")
     print(classification_report(all_labels, all_preds, target_names=CLASSES, digits=3))
     print("Confusion matrix (rows=true, cols=pred):")
     print(CLASSES)
     print(confusion_matrix(all_labels, all_preds))
 
+    m = compute_metrics(all_labels, all_preds)
+    print(
+        f"balanced_accuracy={m['balanced_accuracy']:.4f} macro_f1={m['macro_f1']:.4f} "
+        f"accuracy={m['accuracy']:.4f} mel_recall={m['mel_recall']:.4f}"
+    )
+
+    upsert_model_row(
+        {
+            "version": version,
+            "evaluated_at": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint": path.name,
+            "test_accuracy": f"{m['accuracy']:.4f}",
+            "test_balanced_accuracy": f"{m['balanced_accuracy']:.4f}",
+            "test_macro_f1": f"{m['macro_f1']:.4f}",
+            "test_mel_recall": f"{m['mel_recall']:.4f}",
+            "test_mel_f1": f"{m['mel_f1']:.4f}",
+            "notes": notes,
+        }
+    )
+    print(f"Results for {version} saved to ml/results/models.csv")
+
 
 if __name__ == "__main__":
-    evaluate()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", default=DEFAULT_VERSION)
+    parser.add_argument(
+        "--notes",
+        default="",
+        help="short description of what changed in this version, e.g. 'lr 1e-4 + cosine'",
+    )
+    args = parser.parse_args()
+    evaluate(args.version, args.notes)
