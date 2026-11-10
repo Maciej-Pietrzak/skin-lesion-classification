@@ -76,6 +76,9 @@ Następnie: `ml/src/download_dataset.py` (pobiera HAM10000 z Kaggle) → `ml/src
 fine-tuning; zapisuje checkpoint do `ml/models/efficientnet_b0_ham10000.pt` i log epok do
 `ml/results/training_log.csv`).
 
+Wytrenowane wersje modelu (konfiguracja, wyniki na zbiorze testowym, znane słabości) są opisane
+w [`ml/MODELS.md`](ml/MODELS.md).
+
 ### Frontend
 
 Wymaga uruchomionego backendu (patrz wyżej, domyślnie na `http://127.0.0.1:8000`).
