@@ -16,7 +16,7 @@ personelowi medycznemu poprzez aplikację webową.
 
 - Python 3.12
 - Docker (baza danych PostgreSQL)
-- Wytrenowany checkpoint modelu pod `ml/models/efficientnet_b0_ham10000_v1.pt` — plik jest
+- Wytrenowany checkpoint modelu pod `ml/models/efficientnet_b0_ham10000_v2.pt` — plik jest
   gitignorowany, więc trzeba go samodzielnie wytrenować (patrz sekcja
   [Trening modelu](#trening-modelu-opcjonalnie)) albo skopiować z innego źródła
 

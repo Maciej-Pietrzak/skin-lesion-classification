@@ -7,7 +7,8 @@ Dokumentacja wytrenowanych wersji klasyfikatora zmian skórnych. Same wagi (`ml/
 
 | Wersja | Data       | Architektura    | Test balanced acc. | Test accuracy | Test macro F1 | F1 `mel` | Recall `mel` | Status                    |
 | ------ | ---------- | --------------- | ------------------ | ------------- | ------------- | -------- | ------------ | ------------------------- |
-| v1     | 2026-07-30 | EfficientNet-B0 | 0.665              | 0.738         | 0.601         | 0.482    | 0.558        | bazowy, używany w backendzie |
+| v1     | 2026-07-30 | EfficientNet-B0 | 0.665              | 0.738         | 0.601         | 0.482    | 0.558        | bazowy                   |
+| v2     | 2026-11-10 | EfficientNet-B0 | **0.710**          | **0.793**     | **0.687**     | **0.560** | **0.636**   | używany w backendzie      |
 
 Główna metryka od v2: **balanced accuracy** (średni recall po klasach, oficjalna metryka ISIC
 2018) — według niej trening wybiera checkpoint. Te same liczby w formie do Excela/pandas:
@@ -25,7 +26,7 @@ Główna metryka od v2: **balanced accuracy** (średni recall po klasach, oficja
 | Data treningu | 2026-07-30 (checkpoint zapisany 21:53) |
 | Kod źródłowy | commit `0089e60` („Add ML pipeline: dataset, EfficientNet-B0 transfer learning, Grad-CAM”) |
 | Eksport ONNX | `ml/models/efficientnet_b0_ham10000.onnx` + `.onnx.data` (2026-08-30, `ml/src/export_onnx.py`; stara nazwa bez `_v1` — plik `.onnx` ma zapisaną nazwę pliku z wagami, więc nie zmieniamy jej) — tylko do wizualizacji architektury |
-| Status | model bazowy, ładowany przez backend do `POST /predict` |
+| Status | model bazowy; do 2026-11-10 ładowany przez backend do `POST /predict`, potem zastąpiony przez v2 |
 
 ### Dane
 
@@ -118,6 +119,105 @@ Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
 - Wyższa rozdzielczość wejścia lub większy wariant EfficientNet (B1–B3)
 - Mocniejsze augmentacje (RandomResizedCrop, kontrolowane zmiany kolorów)
 - Dodatkowe metryki w ewaluacji: balanced accuracy, ROC-AUC dla każdej klasy
+
+---
+
+## v2 — dłuższy fine-tuning z cosine LR i early stoppingiem
+
+### Identyfikacja
+
+| | |
+| --- | --- |
+| Plik | `ml/models/efficientnet_b0_ham10000_v2.pt` (state_dict, ~16 MB) |
+| Data treningu | 2026-11-10, 20:24–21:29 (checkpoint zapisany 21:08, po 6. epoce fine-tuningu) |
+| Kod źródłowy | `ml/src/train.py` w commicie, który dodał tę sekcję (podczas treningu zmiany nie były jeszcze w commicie); polecenie: `python -m ml.src.train --version v2` (wartości domyślne) |
+| Status | ładowany przez backend do `POST /predict` (od 2026-11-10) |
+
+### Zmiany względem v1
+
+Dane, architektura, preprocessing, augmentacje i sampler są takie same jak w v1. Zmienił się tylko
+trening:
+
+- Checkpoint jest wybierany według **val balanced accuracy**, a nie val macro F1.
+- Fine-tuning (etap 2) ma lr **1e-4** zamiast 1e-5. v1 uczył się za wolno: val F1 jeszcze rosło
+  w ostatniej epoce.
+- Do etapu 2 dodano **cosine annealing** lr (`CosineAnnealingLR`, `T_max=30`). Lr maleje płynnie
+  od 1e-4 do 0: duże kroki na początku, drobne poprawki na końcu.
+- Etap 2 ma maksymalnie **30 epok** i **early stopping** z `patience=6`.
+- Wszystkie generatory losowe mają stały seed (**42**). Powtórzony trening da bardzo podobny
+  wynik, ale przez niedeterminizm GPU nie zawsze identyczny co do bitu.
+
+### Trening
+
+Adam, batch size 32. Pełny log epok: `ml/results/training_log.csv` (wiersze z `version=v2`).
+
+| Etap | Co trenowane | lr | Epoki | Najlepsza epoka | Val balanced acc. | Val macro F1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 — liniowa sonda | tylko głowica | 1e-3 (stały) | 15 | 13. | 0.613 | 0.471 |
+| 2 — fine-tuning | cała sieć | 1e-4 → cosine | 12 z 30 | 6. | **0.700** | 0.665 |
+
+Jedna epoka trwała ok. 1,7 min w etapie 1 i ok. 3,3 min w etapie 2.
+
+**Przeuczenie w etapie 2.** Od 7. epoki fine-tuningu train balanced accuracy rosło z 0.93 do 0.97,
+a val balanced accuracy spadało z 0.70 do 0.65. Val recall `mel` przestał rosnąć (0.55–0.59).
+Trening przerwano ręcznie po 12. epoce. To ten sam moment, w którym zatrzymałby go early stopping
+(6 epok bez poprawy). Checkpoint zapisuje się tylko przy poprawie wyniku val, więc plik `v2.pt`
+ma wagi z 6. epoki, sprzed przeuczenia.
+
+### Wyniki na zbiorze testowym
+
+Wynik `python -m ml.src.evaluate --version v2` (2026-11-10):
+
+| Klasa | Precision | Recall | F1 | F1 w v1 | Liczba przykładów |
+| --- | --- | --- | --- | --- | --- |
+| akiec | 0.475 | 0.630 | 0.542 | 0.475 | 46 |
+| bcc | 0.609 | 0.746 | 0.671 | 0.596 | 71 |
+| bkl | 0.607 | 0.726 | 0.661 | 0.592 | 168 |
+| df | 0.812 | 0.650 | 0.722 | 0.450 | 20 |
+| **mel** | **0.500** | **0.636** | **0.560** | 0.482 | 165 |
+| nv | 0.945 | 0.846 | 0.893 | 0.862 | 992 |
+| vasc | 0.778 | 0.737 | 0.757 | 0.750 | 19 |
+| **accuracy** | | | **0.793** | 0.738 | 1481 |
+| **macro avg** | 0.675 | 0.710 | **0.687** | 0.601 | 1481 |
+| **balanced accuracy** | | | **0.710** | 0.665 | 1481 |
+| weighted avg | 0.822 | 0.793 | 0.804 | 0.757 | 1481 |
+
+Val balanced accuracy (0.700) i test balanced accuracy (0.710) są niemal identyczne, więc wybrany
+checkpoint dobrze uogólnia. F1 poprawił się we wszystkich klasach; `vasc` wyszedł praktycznie bez
+zmian.
+
+Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
+
+| prawda \ pred | akiec | bcc | bkl | df | mel | nv | vasc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| akiec | **29** | 5 | 10 | 0 | 1 | 1 | 0 |
+| bcc | 6 | **53** | 5 | 0 | 3 | 4 | 0 |
+| bkl | 9 | 6 | **122** | 2 | 12 | 17 | 0 |
+| df | 3 | 3 | 0 | **13** | 0 | 1 | 0 |
+| mel | 11 | 1 | 24 | 0 | **105** | 24 | 0 |
+| nv | 3 | 18 | 40 | 1 | 87 | **839** | 4 |
+| vasc | 0 | 1 | 0 | 0 | 2 | 2 | **14** |
+
+### Znane słabości
+
+- **Czerniak (`mel`) wciąż jest najsłabszą klasą o znaczeniu klinicznym: F1 0.560, recall 0.636.**
+  Model przeocza 60 ze 165 czerniaków (w v1: 73). Klasyfikuje je jako `bkl` (24), `nv` (24) i
+  `akiec` (11). Pomyłek `mel` → `nv` jest więcej niż w v1 (24 zamiast 19), a to najgroźniejszy
+  błąd: czerniak zostaje uznany za zwykłe znamię.
+- 87 znamion (`nv`) jest klasyfikowanych jako czerniak (w v1: 100), stąd precyzja `mel` wynosi
+  tylko 0.500.
+- Szybkie przeuczenie w fine-tuningu: po 6 epokach model zaczyna zapamiętywać zbiór treningowy.
+  Obecne augmentacje i regularyzacja (tylko `Dropout(0.2)`) nie wystarczają przy lr 1e-4.
+- Duży skok `df` (F1 0.45 → 0.72) opiera się na 20 przykładach testowych, więc może wynikać
+  w dużej części z przypadku.
+
+### Pomysły na v3
+
+- Walka z przeuczeniem: mocniejsze augmentacje (`RandomResizedCrop`, silniejszy `ColorJitter`),
+  weight decay (AdamW), większy dropout, mniejsze `patience` (np. 3)
+- Poprawa wykrywania `mel`: większa waga klasy w stracie albo focal loss; próg decyzyjny dla `mel`
+  dobrany na walidacji pod wymagany recall
+- Wyższa rozdzielczość wejścia lub większy wariant EfficientNet (B1–B3)
 
 ---
 
