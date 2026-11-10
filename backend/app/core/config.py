@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://user:password@localhost:5432/skin_lesion_db"
     storage_dir: Path = BASE_DIR / "storage"
     model_checkpoint_path: Path = (
-        BASE_DIR.parent / "ml" / "models" / "efficientnet_b0_ham10000_v2.pt"
+        BASE_DIR.parent / "ml" / "models" / "efficientnet_b0_ham10000_v3.pt"
     )
     device: str = "cpu"
     # Comma-separated origins in .env, e.g. "http://localhost:3000,http://localhost:5173"

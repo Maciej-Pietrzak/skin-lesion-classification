@@ -18,7 +18,7 @@ MODELS_CSV_PATH = RESULTS_DIR / "models.csv"
 
 # The version scripts default to when --version isn't given (evaluate,
 # gradcam, export_onnx). Bump it once a newer version becomes the main model.
-DEFAULT_VERSION = "v2"
+DEFAULT_VERSION = "v3"
 
 MODELS_CSV_FIELDS = [
     "version",

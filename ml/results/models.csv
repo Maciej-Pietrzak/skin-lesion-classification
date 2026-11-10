@@ -1,3 +1,4 @@
 version,evaluated_at,checkpoint,test_accuracy,test_balanced_accuracy,test_macro_f1,test_mel_recall,test_mel_f1,notes
 v1,2026-11-10T20:07:42,efficientnet_b0_ham10000_v1.pt,0.7380,0.6650,0.6010,0.5576,0.4817,"bazowy: etap 1 lr 1e-3 (15 ep), fine-tune lr 1e-5 (~10 ep), Adam, sampler 1/n"
 v2,2026-11-10T21:46:38,efficientnet_b0_ham10000_v2.pt,0.7934,0.7103,0.6865,0.6364,0.5600,"fine-tune lr 1e-4 cosine, early stopping patience 6, przerwany recznie po ep 12 (overfitting), best ep 6, seed 42"
+v3,2026-11-11T00:00:48,efficientnet_b0_ham10000_v3.pt,0.8244,0.7515,0.7316,0.6121,0.5519,"jak v2 + mocniejsza augmentacja (RandomResizedCrop 0.6-1.0, rotacja 45, ColorJitter 0.2 + hue 0.02); early stopping po ep 23, best ep 17, seed 42"

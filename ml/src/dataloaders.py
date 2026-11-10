@@ -15,18 +15,33 @@ INPUT_SIZE = (224, 224)
 
 
 def build_transforms(train: bool) -> transforms.Compose:
-    ops = [transforms.Resize(INPUT_SIZE)]
-
     if train:
-        # Dermatoscopic images have no canonical orientation, so flips/rotation
-        # are label-preserving. Augmenting also reduces overfitting on the
-        # minority classes (df, vasc), which have very few unique lesions.
-        ops += [
+        # Augmentation (train only, applied on the fly -- every time an image is
+        # drawn it gets a new random variant). It matters most for the rare
+        # classes: the WeightedRandomSampler shows the same few df/vasc images
+        # many times per epoch, and with weak augmentation v2 memorized them
+        # (train bal_acc 0.97 vs val 0.65 late in fine-tuning). Since v3:
+        # - RandomResizedCrop instead of a plain Resize: a random part of the
+        #   image at a random scale. scale>=0.6 keeps the lesion (usually
+        #   centred) in frame; ratio around 4:3 matches HAM10000's 600x450.
+        # - Flips and a wider rotation (+-45 deg, was 20): dermatoscopic images
+        #   have no canonical orientation, so these are label-preserving.
+        # - Stronger ColorJitter (0.2, was 0.1) to mimic different dermatoscopes
+        #   and lighting; hue only slightly (0.02), since colour itself is a
+        #   diagnostic feature (e.g. for melanoma).
+        # v1/v2 used: Resize, flips, RandomRotation(20), ColorJitter(0.1, 0.1, 0.1).
+        ops = [
+            transforms.RandomResizedCrop(
+                INPUT_SIZE, scale=(0.6, 1.0), ratio=(0.75, 1.33)
+            ),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(20),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+            transforms.RandomRotation(45),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
         ]
+    else:
+        # Val/test: deterministic, unchanged since v1, so results stay comparable.
+        ops = [transforms.Resize(INPUT_SIZE)]
 
     ops += [
         transforms.ToTensor(),
