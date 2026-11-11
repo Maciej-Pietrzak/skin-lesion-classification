@@ -11,6 +11,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from ml.src.dataloaders import get_dataloaders
+from ml.src.dataset import CLASSES
 from ml.src.metrics import compute_metrics
 from ml.src.model import build_model
 from ml.src.registry import MODELS_DIR, RESULTS_DIR, checkpoint_path
@@ -23,6 +24,7 @@ METRICS_LOG_PATH = RESULTS_DIR / "training_log.csv"
 METRICS_FIELDS = [
     "version",
     "seed",
+    "mel_weight",
     "timestamp",
     "stage",
     "epoch",
@@ -65,13 +67,29 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-# No class weights here: the WeightedRandomSampler in get_dataloaders() already
-# rebalances what the model sees during training, so adding loss-level class
-# weights too would double-correct for the nv/df/vasc imbalance.
-criterion = nn.CrossEntropyLoss()
+def build_criterion(mel_weight: float = 2.0) -> nn.CrossEntropyLoss:
+    """Cross-entropy where errors on true-melanoma images cost mel_weight times
+    more than errors on any other class (all others weigh 1.0).
+
+    This is NOT an imbalance correction -- the WeightedRandomSampler in
+    get_dataloaders() already shows the model every class equally often, and
+    weighting all classes by frequency on top of that would double-correct.
+    It is a deliberate bias towards mel: a missed melanoma is the most
+    dangerous mistake this tool can make, and v3 missed 64/165 of them on the
+    test set (33 called nv). The weight applies by TRUE class, so it penalises
+    missing a melanoma (mel -> nv), not raising a false alarm (nv -> mel).
+
+    Default (2.0) is v4's setting; v1-v3 trained with mel_weight=1.0, i.e. plain
+    unweighted cross-entropy. val_loss uses the same weights, so it isn't
+    comparable across different mel_weight values -- the metrics (balanced
+    accuracy, F1, mel recall) are.
+    """
+    weights = torch.ones(len(CLASSES))
+    weights[CLASSES.index("mel")] = mel_weight
+    return nn.CrossEntropyLoss(weight=weights.to(DEVICE))
 
 
-def run_epoch(model, dataloader, optimizer=None):
+def run_epoch(model, dataloader, criterion, optimizer=None):
     """One pass over dataloader. Trains if optimizer is given, else evaluates."""
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
@@ -103,6 +121,7 @@ def run_training(
     model,
     train_dl,
     val_dl,
+    criterion,
     optimizer,
     num_epochs,
     stage,
@@ -110,6 +129,7 @@ def run_training(
     batch_size,
     version,
     seed,
+    mel_weight,
     best_val_bal_acc=0.0,
     scheduler=None,
     patience=None,
@@ -130,8 +150,8 @@ def run_training(
     for epoch in range(1, num_epochs + 1):
         # LR actually used this epoch (changes each epoch under a scheduler).
         lr = optimizer.param_groups[0]["lr"]
-        train_loss, train_m = run_epoch(model, train_dl, optimizer)
-        val_loss, val_m = run_epoch(model, val_dl)
+        train_loss, train_m = run_epoch(model, train_dl, criterion, optimizer)
+        val_loss, val_m = run_epoch(model, val_dl, criterion)
 
         print(
             f"Epoch {epoch}/{num_epochs} | "
@@ -155,6 +175,7 @@ def run_training(
             {
                 "version": version,
                 "seed": seed,
+                "mel_weight": mel_weight,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "stage": stage,
                 "epoch": epoch,
@@ -189,6 +210,7 @@ def train(
     freeze_backbone: bool = True,
     batch_size: int = 32,
     lr: float = 1e-3,
+    mel_weight: float = 2.0,
 ):
     """Stage 1: train only the classifier head on top of frozen ImageNet features."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -213,7 +235,18 @@ def train(
     )
 
     return run_training(
-        model, train_dl, val_dl, optimizer, num_epochs, "train", lr, batch_size, version, seed
+        model,
+        train_dl,
+        val_dl,
+        build_criterion(mel_weight),
+        optimizer,
+        num_epochs,
+        "train",
+        lr,
+        batch_size,
+        version,
+        seed,
+        mel_weight,
     )
 
 
@@ -225,6 +258,7 @@ def fine_tune(
     lr: float = 1e-4,
     cosine: bool = True,
     patience: int | None = 6,
+    mel_weight: float = 2.0,
 ):
     """Stage 2: unfreeze the whole network and keep training from stage 1's
     best weights, at a lower LR than stage 1 (1e-3 -> 1e-4), so the pretrained
@@ -253,7 +287,8 @@ def fine_tune(
 
     # Score the stage-1 checkpoint first so stage 2 only overwrites it if
     # fine-tuning actually improves on it.
-    _, stage1_val_m = run_epoch(model, val_dl)
+    criterion = build_criterion(mel_weight)
+    _, stage1_val_m = run_epoch(model, val_dl, criterion)
     stage1_val_bal_acc = stage1_val_m["balanced_accuracy"]
     print(f"Stage 1 checkpoint val_bal_acc={stage1_val_bal_acc:.4f} (fine-tuning baseline)")
 
@@ -261,6 +296,7 @@ def fine_tune(
         model,
         train_dl,
         val_dl,
+        criterion,
         optimizer,
         num_epochs,
         "fine_tune",
@@ -268,6 +304,7 @@ def fine_tune(
         batch_size,
         version,
         seed,
+        mel_weight,
         best_val_bal_acc=stage1_val_bal_acc,
         scheduler=scheduler,
         patience=patience,
@@ -282,6 +319,12 @@ if __name__ == "__main__":
         help="name of the new model version, e.g. v2 -> ml/models/efficientnet_b0_ham10000_v2.pt",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--mel-weight",
+        type=float,
+        default=2.0,
+        help="loss weight for true-mel images (both stages); default = v4, v1-v3 used 1.0",
+    )
     # Fine-tuning (stage 2) settings; defaults = v2. v1's settings were
     # --ft-lr 1e-5 --ft-epochs 10 --patience 0 --no-cosine
     parser.add_argument("--ft-lr", type=float, default=1e-4)
@@ -292,10 +335,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-cosine", action="store_true", help="constant LR in stage 2")
     args = parser.parse_args()
 
-    train(args.version, seed=args.seed)
+    train(args.version, seed=args.seed, mel_weight=args.mel_weight)
     fine_tune(
         args.version,
         seed=args.seed,
+        mel_weight=args.mel_weight,
         num_epochs=args.ft_epochs,
         lr=args.ft_lr,
         cosine=not args.no_cosine,

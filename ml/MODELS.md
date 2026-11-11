@@ -8,8 +8,9 @@ Dokumentacja wytrenowanych wersji klasyfikatora zmian skórnych. Same wagi (`ml/
 | Wersja | Data       | Architektura    | Test balanced acc. | Test accuracy | Test macro F1 | F1 `mel` | Recall `mel` | Status                    |
 | ------ | ---------- | --------------- | ------------------ | ------------- | ------------- | -------- | ------------ | ------------------------- |
 | v1     | 2026-07-30 | EfficientNet-B0 | 0.665              | 0.738         | 0.601         | 0.482    | 0.558        | bazowy                   |
-| v2     | 2026-11-10 | EfficientNet-B0 | 0.710              | 0.793         | 0.687         | **0.560** | **0.636**   | poprzedni                 |
+| v2     | 2026-11-10 | EfficientNet-B0 | 0.710              | 0.793         | 0.687         | **0.560** | 0.636        | poprzedni                 |
 | v3     | 2026-11-10 | EfficientNet-B0 | **0.752**          | **0.824**     | **0.732**     | 0.552    | 0.612        | używany w backendzie      |
+| v4     | 2026-11-11 | EfficientNet-B0 | 0.747              | 0.797         | 0.704         | 0.538    | **0.661**    | eksperyment (waga `mel`)  |
 
 Główna metryka od v2: **balanced accuracy** (średni recall po klasach, oficjalna metryka ISIC
 2018) — według niej trening wybiera checkpoint. Te same liczby w formie do Excela/pandas:
@@ -323,6 +324,119 @@ Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
   recall `mel`
 - Dalsza regularyzacja: AdamW z weight decay, większy dropout
 - Wyższa rozdzielczość wejścia lub większy wariant EfficientNet (B1–B3)
+
+---
+
+## v4 — większa waga czerniaka w funkcji straty
+
+### Identyfikacja
+
+| | |
+| --- | --- |
+| Plik | `ml/models/efficientnet_b0_ham10000_v4.pt` (state_dict, ~16 MB) |
+| Data treningu | 2026-11-11, 16:01–17:05 (checkpoint zapisany 16:50, po 7. epoce fine-tuningu) |
+| Kod źródłowy | `ml/src/train.py` (`build_criterion()`) w commicie, który dodał tę sekcję; polecenie: `python -m ml.src.train --version v4` (wartości domyślne, `--mel-weight 2.0`) |
+| Status | eksperyment; backend zostaje przy v3 |
+
+### Zmiany względem v3
+
+Zmieniła się **tylko funkcja straty**: `CrossEntropyLoss` z wagami klas `[1, 1, 1, 1, 2, 1, 1]`,
+czyli błąd na zdjęciu, którego prawdziwa klasa to `mel`, kosztuje 2× więcej (oba etapy treningu).
+Augmentacja, sampler, optymalizator, harmonogram lr i seed są jak w v3.
+
+To nie jest korekta nierównowagi klas, bo tę robi już `WeightedRandomSampler`. To celowe
+przesunięcie modelu na korzyść czerniaka, bo przeoczony czerniak to najgroźniejszy błąd. Waga
+działa według prawdziwej klasy, więc karze przeoczenie (`mel` → `nv`), a nie fałszywy alarm.
+
+Skutek uboczny: `val_loss` jest liczony z tą samą wagą, więc w `training_log.csv` nie da się go
+porównać z v1–v3. Metryki (balanced accuracy, F1, mel recall) są porównywalne. Od v4 log ma
+kolumnę `mel_weight` (dla v2 i v3 uzupełnioną wartością 1.0).
+
+Pierwsza próba treningu została przerwana w 14. epoce etapu 1, bo w systemie zabrakło pamięci
+RAM. Częściowy checkpoint i wiersze logu usunięto, a trening uruchomiono od nowa. Liczby z obu
+prób były identyczne co do 4. miejsca po przecinku, więc stały seed daje w pełni powtarzalny
+trening.
+
+### Trening
+
+Adam, batch size 32, ustawienia jak w v3. Pełny log epok: `ml/results/training_log.csv` (wiersze
+z `version=v4`).
+
+| Etap | Co trenowane | lr | Epoki | Najlepsza epoka | Val balanced acc. | Val macro F1 | Val mel recall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 — liniowa sonda | tylko głowica | 1e-3 (stały) | 15 | 14. | 0.593 | 0.470 | 0.600 |
+| 2 — fine-tuning | cała sieć | 1e-4 → cosine | 13 z 30 | 7. | **0.708** | 0.654 | 0.624 |
+
+Jedna epoka trwała ok. 2,3 min w obu etapach (szybciej niż v3, bo było więcej wolnej pamięci).
+
+**Mel recall na walidacji był w trakcie treningu wyraźnie wyższy niż w v3:** w epokach 1–6
+fine-tuningu 0.62–0.73 (v3: 0.42–0.59). Checkpoint jest jednak wybierany według balanced accuracy,
+a najlepsza pod tym względem była 7. epoka z mel recall 0.624. Epoki 4. (0.729) i 13. (0.700)
+miały lepszy recall czerniaka przy balanced accuracy niższej o 0.01–0.04. Early stopping
+zatrzymał trening po 13. epoce, dużo wcześniej niż v3 (23. epoka, rekordy jeszcze w 13. i 17.).
+
+### Wyniki na zbiorze testowym
+
+Wynik `python -m ml.src.evaluate --version v4` (2026-11-11):
+
+| Klasa | Precision | Recall | F1 | F1 w v3 | Liczba przykładów |
+| --- | --- | --- | --- | --- | --- |
+| akiec | 0.524 | 0.717 | 0.606 | 0.614 | 46 |
+| bcc | 0.675 | 0.789 | 0.727 | 0.726 | 71 |
+| bkl | 0.660 | 0.625 | 0.642 | 0.669 | 168 |
+| df | 0.654 | 0.850 | 0.739 | 0.829 | 20 |
+| **mel** | **0.454** | **0.661** | **0.538** | 0.552 | 165 |
+| nv | 0.947 | 0.853 | 0.898 | 0.920 | 992 |
+| vasc | 0.824 | 0.737 | 0.778 | 0.811 | 19 |
+| **accuracy** | | | **0.797** | 0.824 | 1481 |
+| **macro avg** | 0.677 | 0.747 | **0.704** | 0.732 | 1481 |
+| **balanced accuracy** | | | **0.747** | 0.752 | 1481 |
+| weighted avg | 0.828 | 0.797 | 0.808 | 0.829 | 1481 |
+
+Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
+
+| prawda \ pred | akiec | bcc | bkl | df | mel | nv | vasc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| akiec | **33** | 7 | 5 | 0 | 1 | 0 | 0 |
+| bcc | 5 | **56** | 5 | 0 | 2 | 2 | 1 |
+| bkl | 11 | 3 | **105** | 4 | 30 | 15 | 0 |
+| df | 1 | 1 | 0 | **17** | 0 | 1 | 0 |
+| mel | 11 | 1 | 17 | 1 | **109** | 26 | 0 |
+| nv | 2 | 14 | 27 | 4 | 97 | **846** | 2 |
+| vasc | 0 | 1 | 0 | 0 | 1 | 3 | **14** |
+
+Czerniak w porównaniu z poprzednimi wersjami:
+
+| | v2 | v3 | v4 |
+| --- | --- | --- | --- |
+| Przeoczone `mel` (ze 165) | 60 | 64 | **56** |
+| `mel` → `nv` | **24** | 33 | 26 |
+| Fałszywe alarmy `nv` → `mel` | 87 | **64** | 97 |
+
+### Wnioski
+
+- Waga `mel` robi to, czego się spodziewano: najwyższy recall czerniaka ze wszystkich wersji
+  (0.661) i mniej pomyłek `mel` → `nv` niż w v3 (26 zamiast 33). Kosztem jest 33 fałszywych
+  alarmów `nv` → `mel` więcej, a precyzja `mel` spadła do 0.454.
+- Ogólnie model nie jest lepszy: balanced accuracy praktycznie bez zmian (0.747 vs 0.752,
+  w granicach losowości), macro F1 i accuracy niższe o ok. 0.03. Najbardziej straciły `df`
+  (F1 0.83 → 0.74, ale tylko 20 przykładów), `bkl` i `nv`.
+- Efekt przypomina obniżenie progu decyzyjnego dla `mel`, tylko wbudowane w trening. Próg da
+  podobne przesunięcie bez ponownego treningu i bez wpływu na to, czego model się uczy, a do
+  tego można go ustawić dokładnie pod wymagany recall. Dlatego kolejne wersje wracają do
+  `mel_weight=1.0`, a recall czerniaka zostanie dostrojony progiem na finalnym modelu.
+- Backend zostaje przy v3: według zasady wyboru na walidacji v3 jest lepszy (val balanced
+  accuracy 0.721 vs 0.708) i ma lepsze ogólne metryki na teście.
+- Wybór checkpointu według balanced accuracy gubi część zysku z wagi `mel` (lepsze dla czerniaka
+  epoki 4. i 13. nie zostały wybrane).
+
+### Pomysły na v5
+
+- Większy wariant sieci: EfficientNet-B2 (natywnie 260×260), z ustawieniami v3
+  (`--mel-weight 1.0`)
+- Przed B2: szybsze ładowanie danych (`num_workers > 0`), bo augmentacja jest liczona na CPU
+- Na koniec, dla finalnego modelu: walidacja krzyżowa (5-fold, `StratifiedGroupKFold` po
+  `lesion_id`), próg dla `mel` na predykcjach out-of-fold, ensemble modeli z foldów
 
 ---
 
