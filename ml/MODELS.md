@@ -9,10 +9,11 @@ Dokumentacja wytrenowanych wersji klasyfikatora zmian skórnych. Same wagi (`ml/
 | ------ | ---------- | --------------- | ------------------ | ------------- | ------------- | -------- | ------------ | ------------------------- |
 | v1     | 2026-07-30 | EfficientNet-B0 | 0.665              | 0.738         | 0.601         | 0.482    | 0.558        | bazowy                   |
 | v2     | 2026-11-10 | EfficientNet-B0 | 0.710              | 0.793         | 0.687         | **0.560** | 0.636        | poprzedni                 |
-| v3     | 2026-11-10 | EfficientNet-B0 | **0.752**          | **0.824**     | **0.732**     | 0.552    | 0.612        | używany w backendzie      |
+| v3     | 2026-11-10 | EfficientNet-B0 | 0.752              | **0.824**     | **0.732**     | 0.552    | 0.612        | używany w backendzie      |
 | v4     | 2026-11-11 | EfficientNet-B0 | 0.747              | 0.797         | 0.704         | 0.538    | **0.661**    | eksperyment (waga `mel`)  |
 | v5     | 2026-11-11 | EfficientNet-B2 | 0.730              | 0.797         | 0.683         | 0.550    | 0.588        | eksperyment (B2, 260 px)  |
 | v6     | 2026-11-11 | EfficientNet-B2 | 0.749              | 0.779         | 0.666         | 0.522    | 0.642        | eksperyment (B2, disc. lr) |
+| v7     | 2026-11-11 | EfficientNet-B0 | **0.756**          | 0.780         | 0.695         | 0.516    | 0.636        | eksperyment (native crop + 16-crop TTA) |
 
 Główna metryka od v2: **balanced accuracy** (średni recall po klasach, oficjalna metryka ISIC
 2018) — według niej trening wybiera checkpoint. Te same liczby w formie do Excela/pandas:
@@ -683,6 +684,149 @@ Czerniak w porównaniu z poprzednimi wersjami:
 
 ---
 
+## v7 — cropy w oryginalnej rozdzielczości + 16-crop TTA
+
+### Identyfikacja
+
+| | |
+| --- | --- |
+| Plik | `ml/models/efficientnet_b0_ham10000_v7.pt` (state_dict) + `efficientnet_b0_ham10000_v7.json` (`{"preprocess": "native_crop"}`, w gicie) |
+| Data treningu | 2026-11-11, 20:24–22:10 (checkpoint zapisany 21:57, po 21. epoce fine-tuningu) |
+| Kod źródłowy | commit `897a4e5` („Add native-resolution crop preprocessing with 16-crop test evaluation”); polecenie: `python -m ml.src.train --version v7 --arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0 --preprocess native_crop` |
+| Status | eksperyment; backend zostaje przy v3 (backend i Grad-CAM nie obsługują jeszcze `native_crop`) |
+
+### Zmiany względem v3
+
+Inspiracja: Shen i in. 2021, *Low-cost and high-performance data augmentation for
+deep-learning-based skin lesion classification* (arXiv:2101.02353). Na HAM10000 z EfficientNet
+uzyskali balanced accuracy 0.883 ± 0.013 w 5-krotnej walidacji krzyżowej (z podziałem po zmianie)
+i 0.853 na oficjalnym teście ISIC 2018. Oba wyniki są trochę optymistyczne: w CV najlepszą epokę
+wybierano na foldzie walidacyjnym, a na teście spośród epok 30–90 wysyłanych na serwer ISIC.
+Zamiast zmniejszać zdjęcia, wycinają z nich fragmenty 224×224 w oryginalnej rozdzielczości, a
+przy ocenie uśredniają 16 wycinków (za Gessert i in. 2018).
+
+W v7 zmieniło się **tylko przygotowanie obrazu** (`preprocess="native_crop"` w
+`ml/src/dataloaders.py`); architektura, sampler, strata, lr, epoki i seed są jak w v3:
+
+| | v3 (`resize`) | v7 (`native_crop`) |
+| --- | --- | --- |
+| Trening | `RandomResizedCrop(224, scale 0.6–1.0)`, czyli zdjęcie zmniejszone ok. 2,3× | losowe przeskalowanie całego zdjęcia 0.6–1.4, potem flipy, rotacja ±45°, ColorJitter (jak v3), na końcu losowy crop 224×224 |
+| Walidacja (co epokę) | całe zdjęcie zgniecione do 224×224 | jeden środkowy crop 224×224 z niezmniejszonego zdjęcia |
+| Test | całe zdjęcie zgniecione do 224×224 | **16 cropów 224×224** (siatka 4×4 od lewego górnego do prawego dolnego rogu), uśrednione prawdopodobieństwa softmax |
+
+Walidacja na samym środkowym cropie jest 16× tańsza i wystarcza do wyboru checkpointu. Pełne
+16 cropów liczy tylko `evaluate.py`.
+
+Augmentacja i przepis treningowy z pracy Shen i in. (12 par operacji LCA z p=0.3, ważona strata
+zamiast samplera, 70 epok, Adam 1e-3 ze schodkowym lr) **nie** są w v7 odtworzone. Celowo
+zmieniona jest jedna rzecz naraz.
+
+### Trening
+
+Adam, batch size 32. Pełny log epok: `ml/results/training_log.csv` (wiersze z `version=v7`,
+kolumna `preprocess=native_crop`).
+
+| Etap | Co trenowane | lr | Epoki | Najlepsza epoka | Val balanced acc. | Val macro F1 | Val mel recall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 — liniowa sonda | tylko głowica | 1e-3 (stały) | 15 | 3. | 0.595 | 0.450 | 0.559 |
+| 2 — fine-tuning | cała sieć | 1e-4 → cosine | 27 z 30 | 21. | **0.727** | 0.669 | 0.712 |
+
+Jedna epoka trwała ok. 2,5 min w etapie 1 i 2–3 min w etapie 2, czyli tyle co w v3.
+
+Porównanie fine-tuningu v3 i v7 (train / val balanced accuracy):
+
+| Epoka | v3 | v7 |
+| --- | --- | --- |
+| 1 | 0.747 / 0.647 | 0.640 / 0.643 |
+| 6 | 0.896 / 0.688 | 0.787 / 0.686 |
+| 10 | 0.935 / 0.662 | 0.819 / 0.699 |
+| 17 | 0.960 / **0.721** | 0.860 / 0.702 |
+| 21 | 0.969 / 0.680 | 0.874 / **0.727** |
+
+**Przeuczenie przyszło wyraźnie wolniej.** Losowe cropy w różnej skali są trudniejsze do
+zapamiętania: w 21. epoce train 0.87 zamiast 0.97, różnica train−val ok. 0.15 zamiast ok. 0.29.
+Najlepszy wynik walidacyjny ze wszystkich wersji (0.727), mimo że walidacja widzi tylko środkowy
+crop, czyli ok. 1/4 powierzchni zdjęcia. Val recall `mel` trzymał się na poziomie 0.65–0.77, w v3
+0.42–0.59.
+
+### Wyniki na zbiorze testowym
+
+Wynik `python -m ml.src.evaluate --version v7` (2026-11-11, 16 cropów):
+
+| Klasa | Precision | Recall | F1 | F1 w v6 | F1 w v3 | Liczba przykładów |
+| --- | --- | --- | --- | --- | --- | --- |
+| akiec | 0.794 | 0.587 | 0.675 | 0.561 | 0.614 | 46 |
+| bcc | 0.809 | 0.775 | 0.791 | 0.671 | 0.726 | 71 |
+| bkl | 0.535 | 0.905 | 0.673 | 0.601 | 0.669 | 168 |
+| df | 0.765 | 0.650 | 0.703 | 0.735 | 0.829 | 20 |
+| **mel** | **0.434** | **0.636** | **0.516** | 0.522 | 0.552 | 165 |
+| nv | 0.984 | 0.791 | 0.877 | 0.889 | 0.920 | 992 |
+| vasc | 0.474 | 0.947 | 0.632 | 0.680 | 0.811 | 19 |
+| **accuracy** | | | **0.780** | 0.779 | 0.824 | 1481 |
+| **macro avg** | 0.685 | 0.756 | **0.695** | 0.666 | 0.732 | 1481 |
+| **balanced accuracy** | | | **0.756** | 0.749 | 0.752 | 1481 |
+| weighted avg | 0.848 | 0.780 | 0.798 | 0.790 | 0.829 | 1481 |
+
+Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
+
+| prawda \ pred | akiec | bcc | bkl | df | mel | nv | vasc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| akiec | **27** | 4 | 14 | 0 | 1 | 0 | 0 |
+| bcc | 3 | **55** | 8 | 0 | 1 | 1 | 3 |
+| bkl | 2 | 0 | **152** | 0 | 11 | 1 | 2 |
+| df | 0 | 0 | 6 | **13** | 1 | 0 | 0 |
+| mel | 2 | 0 | 47 | 0 | **105** | 10 | 1 |
+| nv | 0 | 9 | 57 | 4 | 123 | **785** | 14 |
+| vasc | 0 | 0 | 0 | 0 | 0 | 1 | **18** |
+
+Czerniak w porównaniu z poprzednimi wersjami:
+
+| | v3 | v4 | v5 | v6 | v7 |
+| --- | --- | --- | --- | --- | --- |
+| Przeoczone `mel` (ze 165) | 64 | **56** | 68 | 59 | 60 |
+| `mel` → `nv` | 33 | 26 | 35 | 24 | **10** |
+| Fałszywe alarmy `nv` → `mel` | 64 | 97 | **63** | 101 | 123 |
+
+**Ile daje samo 16-crop TTA** (ten sam checkpoint v7 na teście, bez zapisu do `models.csv`):
+
+| Ocena | Balanced acc. | Accuracy | Macro F1 | Recall `mel` | F1 `mel` |
+| --- | --- | --- | --- | --- | --- |
+| 1 środkowy crop | 0.727 | 0.765 | 0.681 | 0.618 | 0.510 |
+| 16 cropów | **0.756** | **0.780** | **0.695** | **0.636** | **0.516** |
+
+16 cropów podnosi balanced accuracy o 0.029, najbardziej dla `bcc` (recall 0.704 → 0.775),
+`bkl` (0.845 → 0.905) i `vasc` (0.895 → 0.947).
+
+### Wnioski
+
+- **Cropy w oryginalnej rozdzielczości nie dały spodziewanego skoku.** Test balanced accuracy
+  0.756 wobec 0.752 w v3, czyli w granicach szumu (przy ok. 20 zdjęciach `df`/`vasc` w teście
+  jedno zdjęcie to ok. 0.007 balanced accuracy). Na jednym środkowym cropie v7 jest wręcz gorszy
+  od v3 (0.727). Cała przewaga pochodzi z uśredniania 16 cropów.
+- **Mniejsze przeuczenie przełożyło się na walidację, ale nie na test.** Najwyższy val (0.727),
+  najmniejsza różnica train−val od v2.
+- **Najmniej czerniaków uznanych za znamię** (`mel` → `nv`: 10, v3: 33), co jest najgroźniejszym
+  błędem. Przeoczone `mel` trafiają za to głównie do `bkl` (47).
+- **Model nadmiernie wskazuje rzadkie klasy kosztem `nv`:** 123 znamiona uznane za czerniaka i 57
+  za `bkl`. Precyzja `mel` 0.434, `bkl` 0.535, `vasc` 0.474 przy wysokim recallu. Stąd niższe
+  accuracy i macro F1 niż w v3. Prawdopodobna przyczyna: `WeightedRandomSampler` pokazuje każdą
+  klasę równie często, więc model uczy się równych częstości klas, a w teście `nv` to 67%.
+- Luka do wyników Shen i in. (0.853 na teście ISIC 2018) musi pochodzić z innych różnic niż sama
+  geometria: augmentacji LCA, ważonej straty zamiast samplera, dłuższego treningu, a w części z
+  ilości danych (ich model finalny trenowano na całym HAM10000, 10 015 zdjęć, nasz na 7002).
+- Backend zostaje przy v3: lepsze accuracy i macro F1 przy praktycznie równej balanced accuracy,
+  a v7 wymagałby obsługi 16 cropów w backendzie.
+
+### Pomysły na v8
+
+- Bez treningu: strojenie przesunięć logitów klas na walidacji (celuje w nadmiar `nv` → `mel` /
+  `bkl`), TTA z flipami także dla v3.
+- Augmentacja LCA z pracy Shen i in. (ich kod jest publiczny), potem ważona strata zamiast
+  samplera i ich harmonogram lr (70 epok).
+- Na koniec: model finalny trenowany na train+val z ustawieniami wybranymi na walidacji.
+
+---
+
 ## Jak dodać nową wersję
 
 Każda wersja ma własny plik `ml/models/<architektura>_ham10000_<wersja>.pt`, np.
@@ -703,13 +847,18 @@ Wcześniejsze wersje odtwarza się flagami:
 | v3 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0` |
 | v4 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0 --mel-weight 2.0` |
 | v5 | `--ft-lr 1e-4 --ft-head-lr 0` |
+| v7 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0 --preprocess native_crop` |
+
+Domyślnie `--preprocess resize` (v1–v6). Tryb jest zapisywany w pliku `.json` obok checkpointu
+(`ml/models/<architektura>_ham10000_<wersja>.json`, w gicie), skąd fine-tuning i `evaluate.py`
+odczytują, jak przygotować obraz. Wersje bez tego pliku są traktowane jako `resize`.
 
 Od 2026-11-11 dane ładują 2 procesy w tle (`num_workers=2` w `ml/src/dataloaders.py`, ok. 2,7×
 szybszy trening). Wyniki przy tym samym seedzie są powtarzalne, ale nie identyczne co do bitu z
 treningami v1–v4, które ładowały dane w jednym procesie.
 
 1. Wytrenuj model: `python -m ml.src.train --version vN`. Log każdej epoki (z kolumnami `version`,
-   `arch`, `amp`, `seed`, `mel_weight`) trafia do `ml/results/training_log.csv`.
+   `arch`, `amp`, `preprocess`, `seed`, `mel_weight`) trafia do `ml/results/training_log.csv`.
 2. Oceń go na zbiorze testowym: `python -m ml.src.evaluate --version vN --notes "co się zmieniło"`.
    Wiersz z wynikami trafia do `ml/results/models.csv` (ponowne uruchomienie dla tej samej wersji
    nadpisuje jej wiersz, nie dubluje go).

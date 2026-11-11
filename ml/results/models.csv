@@ -5,3 +5,4 @@ v3,2026-11-11T00:00:48,efficientnet_b0_ham10000_v3.pt,0.8244,0.7515,0.7316,0.612
 v4,2026-11-11T17:10:06,efficientnet_b0_ham10000_v4.pt,0.7968,0.7473,0.7040,0.6606,0.5383,resize,"jak v3 + waga mel 2.0 w CrossEntropyLoss (oba etapy); early stopping po ep 13, best ep 7, seed 42"
 v5,2026-11-11T18:44:11,efficientnet_b2_ham10000_v5.pt,0.7968,0.7303,0.6832,0.5879,0.5496,resize,"EfficientNet-B2 260px + AMP, reszta jak v3 (mel_weight 1.0, num_workers 2); early stopping po ep 12, best ep 6, seed 42"
 v6,2026-11-11T19:39:31,efficientnet_b2_ham10000_v6.pt,0.7785,0.7489,0.6656,0.6424,0.5222,resize,"jak v5 (B2 260px AMP) + discriminative lr w fine-tuningu: backbone 3e-5, glowica 3e-4; early stopping po ep 12, best ep 6, seed 42"
+v7,2026-11-11T22:11:49,efficientnet_b0_ham10000_v7.pt,0.7799,0.7559,0.6952,0.6364,0.5160,native_crop,"native crop 224 (scale 0.6-1.4) + 16-crop TTA na tescie, val na srodkowym cropie; reszta jak v3 (B0, ft lr 1e-4 cosine)"
