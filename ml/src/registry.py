@@ -9,6 +9,7 @@ the machine-readable summary of the same versions.
 """
 
 import csv
+import json
 from pathlib import Path
 
 import torch
@@ -34,6 +35,7 @@ MODELS_CSV_FIELDS = [
     "test_macro_f1",
     "test_mel_recall",
     "test_mel_f1",
+    "preprocess",
     "notes",
 ]
 
@@ -69,6 +71,29 @@ def arch_from_checkpoint(path: Path | str) -> str:
             f"<arch>_ham10000_<version>.pt with arch in {list(ARCHITECTURES)}"
         )
     return arch
+
+
+def meta_path(ckpt_path: Path | str) -> Path:
+    """Small JSON file next to a checkpoint (same name, .json) with settings
+    that the file name can't carry but loading code must know -- currently
+    how images have to be preprocessed. Unlike the .pt files it is tracked
+    in git."""
+    return Path(ckpt_path).with_suffix(".json")
+
+
+def save_checkpoint_meta(ckpt_path: Path | str, meta: dict) -> None:
+    with open(meta_path(ckpt_path), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def preprocess_of(ckpt_path: Path | str) -> str:
+    """The preprocess mode (dataloaders.PREPROCESS_MODES) a version was trained
+    with. v1-v6 have no meta file: they all used "resize"."""
+    path = meta_path(ckpt_path)
+    if not path.exists():
+        return "resize"
+    with open(path) as f:
+        return json.load(f)["preprocess"]
 
 
 def load_trained_model(path: Path | str, device) -> tuple[nn.Module, str]:

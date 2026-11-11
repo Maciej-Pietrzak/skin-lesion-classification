@@ -15,29 +15,49 @@ from ml.src.registry import (
     DEFAULT_VERSION,
     find_checkpoint,
     load_trained_model,
+    preprocess_of,
     upsert_model_row,
 )
 from ml.src.train import DEVICE
 
 
+def predict_proba(model, imgs: torch.Tensor) -> torch.Tensor:
+    """Class probabilities, shape (B, num_classes).
+
+    imgs is either (B, C, H, W) -- one view per image -- or (B, N, C, H, W)
+    -- N crops per image ("native_crop" test set). Crops are flattened into
+    one batch for the model and their softmax probabilities averaged per
+    image (probabilities, not logits, so one over-confident crop can't
+    dominate the vote).
+    """
+    if imgs.dim() == 4:
+        return model(imgs).softmax(dim=1)
+    b, n = imgs.shape[:2]
+    probs = model(imgs.flatten(0, 1)).softmax(dim=1)
+    return probs.view(b, n, -1).mean(dim=1)
+
+
 def evaluate(version: str = DEFAULT_VERSION, notes: str = ""):
     # Architecture (and with it the input size) comes from the checkpoint's
-    # file name, so this works for B0 and B2 versions alike. Evaluation runs
-    # in full 32-bit precision even for models trained with amp: no gradients
-    # are kept here, so memory isn't an issue.
+    # file name, preprocessing from its meta file (v1-v6: "resize"), so this
+    # works for every version. Evaluation runs in full 32-bit precision even
+    # for models trained with amp: no gradients are kept here.
     path = find_checkpoint(version)
     model, arch = load_trained_model(path, DEVICE)
-    _, _, test_dl = get_dataloaders(input_size(arch), batch_size=32)
+    preprocess = preprocess_of(path)
+    # 16 crops per image: batch 8 = 128 crops per forward pass, about what
+    # batch 32 is for the single-view versions, so it fits the 4 GB GPU.
+    batch_size = 8 if preprocess == "native_crop" else 32
+    _, _, test_dl = get_dataloaders(input_size(arch), batch_size=batch_size, preprocess=preprocess)
 
     all_preds, all_labels = [], []
     with torch.no_grad():
         for imgs, labels in test_dl:
-            imgs = imgs.to(DEVICE)
-            outputs = model(imgs)
-            all_preds.extend(outputs.argmax(dim=1).cpu().tolist())
+            probs = predict_proba(model, imgs.to(DEVICE))
+            all_preds.extend(probs.argmax(dim=1).cpu().tolist())
             all_labels.extend(labels.tolist())
 
-    print(f"Model version: {version} ({path.name})")
+    print(f"Model version: {version} ({path.name}, preprocess={preprocess})")
     print(classification_report(all_labels, all_preds, target_names=CLASSES, digits=3))
     print("Confusion matrix (rows=true, cols=pred):")
     print(CLASSES)
@@ -59,6 +79,7 @@ def evaluate(version: str = DEFAULT_VERSION, notes: str = ""):
             "test_macro_f1": f"{m['macro_f1']:.4f}",
             "test_mel_recall": f"{m['mel_recall']:.4f}",
             "test_mel_f1": f"{m['mel_f1']:.4f}",
+            "preprocess": preprocess,
             "notes": notes,
         }
     )

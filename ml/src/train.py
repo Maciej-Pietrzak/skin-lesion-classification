@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from ml.src.dataloaders import get_dataloaders
+from ml.src.dataloaders import PREPROCESS_MODES, get_dataloaders
 from ml.src.dataset import CLASSES
 from ml.src.metrics import compute_metrics
 from ml.src.model import ARCHITECTURES, build_model, input_size
@@ -19,6 +19,8 @@ from ml.src.registry import (
     RESULTS_DIR,
     checkpoint_path,
     existing_checkpoints,
+    preprocess_of,
+    save_checkpoint_meta,
 )
 
 # Append-only log of every epoch across every run, so results from different
@@ -30,6 +32,7 @@ METRICS_FIELDS = [
     "version",
     "arch",
     "amp",
+    "preprocess",
     "seed",
     "mel_weight",
     "timestamp",
@@ -232,12 +235,13 @@ def run_training(
     return best_val_bal_acc
 
 
-def make_run_info(version, arch, amp, seed, mel_weight, batch_size) -> dict:
+def make_run_info(version, arch, amp, preprocess, seed, mel_weight, batch_size) -> dict:
     # amp is only used on CUDA; on a CPU-only machine it is switched off.
     return {
         "version": version,
         "arch": arch,
         "amp": amp and DEVICE.type == "cuda",
+        "preprocess": preprocess,
         "seed": seed,
         "mel_weight": mel_weight,
         "batch_size": batch_size,
@@ -248,6 +252,7 @@ def train(
     version: str,
     arch: str = "efficientnet_b2",
     amp: bool = True,
+    preprocess: str = "resize",
     seed: int = 42,
     num_epochs: int = 15,
     freeze_backbone: bool = True,
@@ -255,7 +260,13 @@ def train(
     lr: float = 1e-3,
     mel_weight: float = 1.0,
 ):
-    """Stage 1: train only the classifier head on top of frozen ImageNet features."""
+    """Stage 1: train only the classifier head on top of frozen ImageNet features.
+
+    preprocess: how images are fed to the model, see
+    dataloaders.build_transforms(). It is saved next to the checkpoint
+    (registry.save_checkpoint_meta), because evaluation and the backend must
+    preprocess the same way the model was trained.
+    """
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Every version gets its own file, and an existing one is never
@@ -268,8 +279,12 @@ def train(
             f"version name (e.g. the next vN) instead of overwriting an earlier model."
         )
 
+    save_checkpoint_meta(checkpoint_path(version, arch), {"preprocess": preprocess})
+
     set_seed(seed)
-    train_dl, val_dl, _ = get_dataloaders(input_size(arch), batch_size=batch_size)
+    train_dl, val_dl, _ = get_dataloaders(
+        input_size(arch), batch_size=batch_size, preprocess=preprocess
+    )
     model = build_model(arch, freeze_backbone=freeze_backbone).to(DEVICE)
 
     # Only pass trainable params to the optimizer; with freeze_backbone=True
@@ -286,7 +301,7 @@ def train(
         optimizer,
         num_epochs,
         "train",
-        make_run_info(version, arch, amp, seed, mel_weight, batch_size),
+        make_run_info(version, arch, amp, preprocess, seed, mel_weight, batch_size),
     )
 
 
@@ -322,9 +337,14 @@ def fine_tune(
     early, fine adjustments at the end. Early stopping (patience) ends
     training once the val score stops improving.
     """
+    # Stage 2 always uses stage 1's preprocessing, read from its meta file.
+    preprocess = preprocess_of(checkpoint_path(version, arch))
+
     set_seed(seed)
-    train_dl, val_dl, _ = get_dataloaders(input_size(arch), batch_size=batch_size)
-    run_info = make_run_info(version, arch, amp, seed, mel_weight, batch_size)
+    train_dl, val_dl, _ = get_dataloaders(
+        input_size(arch), batch_size=batch_size, preprocess=preprocess
+    )
+    run_info = make_run_info(version, arch, amp, preprocess, seed, mel_weight, batch_size)
 
     model = build_model(arch, freeze_backbone=False).to(DEVICE)
     # Stage 1 of this same version wrote this file; stage 2 continues from it.
@@ -380,6 +400,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-amp", action="store_true", help="train in full 32-bit precision (v1-v4)"
     )
+    parser.add_argument(
+        "--preprocess",
+        choices=PREPROCESS_MODES,
+        default="resize",
+        help="resize = shrink whole image (v1-v6); native_crop = crops at original "
+        "resolution, 16-crop test evaluation (v7+)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--mel-weight",
@@ -407,7 +434,7 @@ if __name__ == "__main__":
     common = dict(
         arch=args.arch, amp=not args.no_amp, seed=args.seed, mel_weight=args.mel_weight
     )
-    train(args.version, **common)
+    train(args.version, **common, preprocess=args.preprocess)
     fine_tune(
         args.version,
         **common,
