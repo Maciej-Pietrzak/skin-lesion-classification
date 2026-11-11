@@ -7,7 +7,13 @@ from PIL import Image
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import transforms
 
-from ml.src.dataset import HAM10000Dataset
+from ml.src.dataset import DATA_DIR, HAM10000Dataset
+from ml.src.lca import LowCostAugment
+
+# "base" = the augmentation of v3 (resize) / v7 (native_crop).
+# "lca" (since v8) = base + one Low-Cost-Augment sub-policy with p=0.3 on top
+# (ml/src/lca.py); native_crop only.
+AUGMENT_MODES = ("base", "lca")
 
 # EfficientNet's ImageNet-pretrained weights (B0 and B2 alike) expect inputs
 # normalized with these exact statistics; using anything else would mismatch
@@ -79,6 +85,8 @@ def build_transforms(
     input_size: tuple[int, int],
     preprocess: str = "resize",
     multi_crop: bool = True,
+    augment: str = "base",
+    pairing_paths: list | None = None,
 ) -> transforms.Compose:
     """input_size is the model's (height, width) -- model.input_size(arch):
     224x224 for B0, 260x260 for B2. It has no default on purpose: feeding a
@@ -94,9 +102,18 @@ def build_transforms(
       used for validation after every training epoch, where it only has to
       rank checkpoints, not give the final score.
     multi_crop is ignored in "resize" mode.
+
+    augment (train only): "base" or "lca". "lca" adds a LowCostAugment step
+    after the base augmentation and before the crop, so it works on the
+    full-resolution image as in the paper; pairing_paths = training image
+    files for its sample-pairing operation.
     """
     if preprocess not in PREPROCESS_MODES:
         raise ValueError(f"preprocess must be one of {PREPROCESS_MODES}, got {preprocess!r}")
+    if augment not in AUGMENT_MODES:
+        raise ValueError(f"augment must be one of {AUGMENT_MODES}, got {augment!r}")
+    if train and augment == "lca" and preprocess != "native_crop":
+        raise ValueError('augment="lca" is only implemented for preprocess="native_crop"')
 
     to_tensor = transforms.Compose([
         transforms.ToTensor(),
@@ -108,15 +125,21 @@ def build_transforms(
             # Same flips / rotation / colour as v3, only the geometry differs:
             # rotate the full image first, then crop, so the crop rarely
             # reaches the black corners the rotation leaves behind.
-            return transforms.Compose([
+            ops = [
                 RandomScale((0.6, 1.4)),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomVerticalFlip(),
                 transforms.RandomRotation(45),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
-                transforms.RandomCrop(input_size),
-                to_tensor,
-            ])
+            ]
+            if augment == "lca":
+                ops.append(LowCostAugment(pairing_paths or []))
+            # pad_if_needed: LCA's own Scale (0.6x) on top of RandomScale
+            # (0.6x) can leave a 216x162 image, smaller than the crop; it is
+            # then padded with black. Never triggers without LCA (min 360x270),
+            # so v7 is unaffected.
+            ops += [transforms.RandomCrop(input_size, pad_if_needed=True), to_tensor]
+            return transforms.Compose(ops)
         if multi_crop:
             return GridCrops(input_size, GRID_CROPS_PER_SIDE, to_tensor)
         return transforms.Compose([transforms.CenterCrop(input_size), to_tensor])
@@ -168,6 +191,7 @@ def get_dataloaders(
     batch_size: int = 32,
     num_workers: int = 2,
     preprocess: str = "resize",
+    augment: str = "base",
 ):
     # With preprocess="native_crop", val is a single centre crop per image
     # (fast, checked every epoch) and test is the 16-crop grid, so test
@@ -189,7 +213,14 @@ def get_dataloaders(
         "persistent_workers": num_workers > 0,
         "pin_memory": torch.cuda.is_available(),
     }
-    train_ds = HAM10000Dataset("train", transform=build_transforms(True, input_size, preprocess))
+    train_ds = HAM10000Dataset("train")
+    train_ds.transform = build_transforms(
+        True,
+        input_size,
+        preprocess,
+        augment=augment,
+        pairing_paths=[DATA_DIR / p for p in train_ds.df["image_path"]],
+    )
     val_ds = HAM10000Dataset(
         "val", transform=build_transforms(False, input_size, preprocess, multi_crop=False)
     )

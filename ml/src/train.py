@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from ml.src.dataloaders import PREPROCESS_MODES, get_dataloaders
+from ml.src.dataloaders import AUGMENT_MODES, PREPROCESS_MODES, get_dataloaders
 from ml.src.dataset import CLASSES
 from ml.src.metrics import compute_metrics
 from ml.src.model import ARCHITECTURES, build_model, input_size
@@ -18,6 +18,7 @@ from ml.src.registry import (
     MODELS_DIR,
     RESULTS_DIR,
     checkpoint_path,
+    augment_of,
     existing_checkpoints,
     preprocess_of,
     save_checkpoint_meta,
@@ -33,6 +34,7 @@ METRICS_FIELDS = [
     "arch",
     "amp",
     "preprocess",
+    "augment",
     "seed",
     "mel_weight",
     "timestamp",
@@ -235,13 +237,14 @@ def run_training(
     return best_val_bal_acc
 
 
-def make_run_info(version, arch, amp, preprocess, seed, mel_weight, batch_size) -> dict:
+def make_run_info(version, arch, amp, preprocess, augment, seed, mel_weight, batch_size) -> dict:
     # amp is only used on CUDA; on a CPU-only machine it is switched off.
     return {
         "version": version,
         "arch": arch,
         "amp": amp and DEVICE.type == "cuda",
         "preprocess": preprocess,
+        "augment": augment,
         "seed": seed,
         "mel_weight": mel_weight,
         "batch_size": batch_size,
@@ -253,6 +256,7 @@ def train(
     arch: str = "efficientnet_b2",
     amp: bool = True,
     preprocess: str = "resize",
+    augment: str = "base",
     seed: int = 42,
     num_epochs: int = 15,
     freeze_backbone: bool = True,
@@ -265,7 +269,9 @@ def train(
     preprocess: how images are fed to the model, see
     dataloaders.build_transforms(). It is saved next to the checkpoint
     (registry.save_checkpoint_meta), because evaluation and the backend must
-    preprocess the same way the model was trained.
+    preprocess the same way the model was trained. augment (train-only
+    augmentation, "base" or "lca") goes into the same file for the record
+    and for stage 2.
     """
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -279,11 +285,13 @@ def train(
             f"version name (e.g. the next vN) instead of overwriting an earlier model."
         )
 
-    save_checkpoint_meta(checkpoint_path(version, arch), {"preprocess": preprocess})
+    save_checkpoint_meta(
+        checkpoint_path(version, arch), {"preprocess": preprocess, "augment": augment}
+    )
 
     set_seed(seed)
     train_dl, val_dl, _ = get_dataloaders(
-        input_size(arch), batch_size=batch_size, preprocess=preprocess
+        input_size(arch), batch_size=batch_size, preprocess=preprocess, augment=augment
     )
     model = build_model(arch, freeze_backbone=freeze_backbone).to(DEVICE)
 
@@ -301,7 +309,7 @@ def train(
         optimizer,
         num_epochs,
         "train",
-        make_run_info(version, arch, amp, preprocess, seed, mel_weight, batch_size),
+        make_run_info(version, arch, amp, preprocess, augment, seed, mel_weight, batch_size),
     )
 
 
@@ -337,14 +345,18 @@ def fine_tune(
     early, fine adjustments at the end. Early stopping (patience) ends
     training once the val score stops improving.
     """
-    # Stage 2 always uses stage 1's preprocessing, read from its meta file.
+    # Stage 2 always uses stage 1's preprocessing and augmentation, read from
+    # its meta file.
     preprocess = preprocess_of(checkpoint_path(version, arch))
+    augment = augment_of(checkpoint_path(version, arch))
 
     set_seed(seed)
     train_dl, val_dl, _ = get_dataloaders(
-        input_size(arch), batch_size=batch_size, preprocess=preprocess
+        input_size(arch), batch_size=batch_size, preprocess=preprocess, augment=augment
     )
-    run_info = make_run_info(version, arch, amp, preprocess, seed, mel_weight, batch_size)
+    run_info = make_run_info(
+        version, arch, amp, preprocess, augment, seed, mel_weight, batch_size
+    )
 
     model = build_model(arch, freeze_backbone=False).to(DEVICE)
     # Stage 1 of this same version wrote this file; stage 2 continues from it.
@@ -407,6 +419,13 @@ if __name__ == "__main__":
         help="resize = shrink whole image (v1-v6); native_crop = crops at original "
         "resolution, 16-crop test evaluation (v7+)",
     )
+    parser.add_argument(
+        "--augment",
+        choices=AUGMENT_MODES,
+        default="base",
+        help="base = flips/rotation/colour jitter (v1-v7); lca = base + one "
+        "Low-Cost-Augment sub-policy with p=0.3 (v8+, native_crop only)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--mel-weight",
@@ -434,7 +453,7 @@ if __name__ == "__main__":
     common = dict(
         arch=args.arch, amp=not args.no_amp, seed=args.seed, mel_weight=args.mel_weight
     )
-    train(args.version, **common, preprocess=args.preprocess)
+    train(args.version, **common, preprocess=args.preprocess, augment=args.augment)
     fine_tune(
         args.version,
         **common,

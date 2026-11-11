@@ -86,14 +86,24 @@ def save_checkpoint_meta(ckpt_path: Path | str, meta: dict) -> None:
         json.dump(meta, f, indent=2)
 
 
+def _meta_value(ckpt_path: Path | str, key: str, default: str) -> str:
+    path = meta_path(ckpt_path)
+    if not path.exists():
+        return default
+    with open(path) as f:
+        return json.load(f).get(key, default)
+
+
 def preprocess_of(ckpt_path: Path | str) -> str:
     """The preprocess mode (dataloaders.PREPROCESS_MODES) a version was trained
     with. v1-v6 have no meta file: they all used "resize"."""
-    path = meta_path(ckpt_path)
-    if not path.exists():
-        return "resize"
-    with open(path) as f:
-        return json.load(f)["preprocess"]
+    return _meta_value(ckpt_path, "preprocess", "resize")
+
+
+def augment_of(ckpt_path: Path | str) -> str:
+    """The train augmentation (dataloaders.AUGMENT_MODES) of a version; v1-v7
+    used "base" (v7's meta file predates the key)."""
+    return _meta_value(ckpt_path, "augment", "base")
 
 
 def load_trained_model(path: Path | str, device) -> tuple[nn.Module, str]:
