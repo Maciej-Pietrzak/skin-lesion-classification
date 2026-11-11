@@ -1,4 +1,4 @@
-"""Transforms and DataLoaders for HAM10000, ready for EfficientNet-B0 transfer learning."""
+"""Transforms and DataLoaders for HAM10000, ready for EfficientNet transfer learning."""
 
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -6,15 +6,18 @@ from torchvision import transforms
 
 from ml.src.dataset import HAM10000Dataset
 
-# EfficientNet-B0's ImageNet-pretrained weights expect inputs normalized with
-# these exact statistics; using anything else would mismatch what the
-# pretrained filters learned to expect and waste the transfer learning.
+# EfficientNet's ImageNet-pretrained weights (B0 and B2 alike) expect inputs
+# normalized with these exact statistics; using anything else would mismatch
+# what the pretrained filters learned to expect and waste the transfer learning.
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
-INPUT_SIZE = (224, 224)
 
 
-def build_transforms(train: bool) -> transforms.Compose:
+def build_transforms(train: bool, input_size: tuple[int, int]) -> transforms.Compose:
+    """input_size is the model's (height, width) -- model.input_size(arch):
+    224x224 for B0, 260x260 for B2. It has no default on purpose: feeding a
+    model images at a size it wasn't trained at silently degrades predictions.
+    """
     if train:
         # Augmentation (train only, applied on the fly -- every time an image is
         # drawn it gets a new random variant). It matters most for the rare
@@ -32,7 +35,7 @@ def build_transforms(train: bool) -> transforms.Compose:
         # v1/v2 used: Resize, flips, RandomRotation(20), ColorJitter(0.1, 0.1, 0.1).
         ops = [
             transforms.RandomResizedCrop(
-                INPUT_SIZE, scale=(0.6, 1.0), ratio=(0.75, 1.33)
+                input_size, scale=(0.6, 1.0), ratio=(0.75, 1.33)
             ),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
@@ -41,7 +44,7 @@ def build_transforms(train: bool) -> transforms.Compose:
         ]
     else:
         # Val/test: deterministic, unchanged since v1, so results stay comparable.
-        ops = [transforms.Resize(INPUT_SIZE)]
+        ops = [transforms.Resize(input_size)]
 
     ops += [
         transforms.ToTensor(),
@@ -60,24 +63,32 @@ def compute_sample_weights(dataset: HAM10000Dataset) -> torch.Tensor:
     return torch.tensor(sample_weights.values, dtype=torch.double)
 
 
-def get_dataloaders(batch_size: int = 32, num_workers: int = 0):
-    # num_workers=0 avoids Windows multiprocessing pitfalls; if you raise it,
-    # the calling script needs an `if __name__ == "__main__":` guard.
-    train_ds = HAM10000Dataset("train", transform=build_transforms(train=True))
-    val_ds = HAM10000Dataset("val", transform=build_transforms(train=False))
-    test_ds = HAM10000Dataset("test", transform=build_transforms(train=False))
+def get_dataloaders(input_size: tuple[int, int], batch_size: int = 32, num_workers: int = 2):
+    # num_workers = background processes that load + augment the next batches
+    # while the GPU works on the current one. With 0 (v1-v4) everything ran in
+    # one process and the GPU sat idle during JPEG decoding and augmentation,
+    # which got noticeably slower with v3's heavier augmentation. Each worker is
+    # a separate Python process (~0.3-0.5 GB RAM), so this stays modest -- this
+    # machine has run out of RAM during training before. On Windows, every
+    # script that calls this needs an `if __name__ == "__main__":` guard
+    # (train/evaluate/gradcam have one). Results stay reproducible with a fixed
+    # seed, but not bit-identical to runs with a different num_workers.
+    loader_kwargs = {
+        "num_workers": num_workers,
+        # Keep workers alive between epochs instead of re-spawning them (slow
+        # on Windows, where each worker re-imports torch).
+        "persistent_workers": num_workers > 0,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    train_ds = HAM10000Dataset("train", transform=build_transforms(True, input_size))
+    val_ds = HAM10000Dataset("val", transform=build_transforms(False, input_size))
+    test_ds = HAM10000Dataset("test", transform=build_transforms(False, input_size))
 
     sampler = WeightedRandomSampler(
         compute_sample_weights(train_ds), num_samples=len(train_ds), replacement=True
     )
 
-    train_dl = DataLoader(
-        train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers
-    )
-    val_dl = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
-    test_dl = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
+    train_dl = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, **loader_kwargs)
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
+    test_dl = DataLoader(test_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
     return train_dl, val_dl, test_dl

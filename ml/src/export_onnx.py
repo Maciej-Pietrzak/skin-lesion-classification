@@ -8,23 +8,23 @@ actual computation graph, which is what a graph viewer needs.
 
 import torch
 
-from ml.src.model import build_model
-from ml.src.registry import DEFAULT_VERSION, checkpoint_path
+from ml.src.model import input_size
+from ml.src.registry import DEFAULT_VERSION, find_checkpoint, load_trained_model
 from ml.src.train import DEVICE
 
 
 def export(version: str = DEFAULT_VERSION):
     # Same name as the checkpoint, just .onnx (+ .onnx.data with the weights).
-    output_path = checkpoint_path(version).with_suffix(".onnx")
+    path = find_checkpoint(version)
+    output_path = path.with_suffix(".onnx")
 
-    model = build_model().to(DEVICE)
-    model.load_state_dict(torch.load(checkpoint_path(version), map_location=DEVICE))
-    model.eval()
+    model, arch = load_trained_model(path, DEVICE)
 
-    # Shape must match dataloaders.py's INPUT_SIZE (224x224) and channel
-    # count (RGB) -- torch.onnx.export traces the graph by actually running
-    # this dummy input through the model, so it only needs to be shape-valid.
-    dummy_input = torch.randn(1, 3, 224, 224, device=DEVICE)
+    # Shape must match the architecture's input size (224x224 for B0, 260x260
+    # for B2) and channel count (RGB) -- torch.onnx.export traces the graph by
+    # actually running this dummy input through the model, so it only needs to
+    # be shape-valid.
+    dummy_input = torch.randn(1, 3, *input_size(arch), device=DEVICE)
 
     torch.onnx.export(
         model,

@@ -15,8 +15,8 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from ml.src.dataloaders import IMAGENET_MEAN, IMAGENET_STD, build_transforms
 from ml.src.dataset import CLASSES, HAM10000Dataset
-from ml.src.model import build_model
-from ml.src.registry import DEFAULT_VERSION, checkpoint_path
+from ml.src.model import input_size
+from ml.src.registry import DEFAULT_VERSION, find_checkpoint, load_trained_model
 from ml.src.train import DEVICE
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs" / "gradcam"
@@ -48,16 +48,14 @@ def pick_one_index_per_class(test_ds: HAM10000Dataset) -> list[int]:
 def generate(version: str = DEFAULT_VERSION):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    model = build_model().to(DEVICE)
-    model.load_state_dict(torch.load(checkpoint_path(version), map_location=DEVICE))
-    model.eval()
+    model, arch = load_trained_model(find_checkpoint(version), DEVICE)
 
-    # model.features[-1] is EfficientNet-B0's last conv block, the deepest
+    # model.features[-1] is the EfficientNet's (B0 or B2) last conv block, the deepest
     # layer that still has spatial resolution (before global pooling)
     # -- the standard Grad-CAM target for this architecture.
     cam = GradCAM(model=model, target_layers=[model.features[-1]])
 
-    test_ds = HAM10000Dataset("test", transform=build_transforms(train=False))
+    test_ds = HAM10000Dataset("test", transform=build_transforms(False, input_size(arch)))
 
     for i in pick_one_index_per_class(test_ds):
         img_tensor, label = test_ds[i]

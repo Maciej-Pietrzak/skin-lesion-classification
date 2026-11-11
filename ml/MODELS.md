@@ -11,6 +11,7 @@ Dokumentacja wytrenowanych wersji klasyfikatora zmian skórnych. Same wagi (`ml/
 | v2     | 2026-11-10 | EfficientNet-B0 | 0.710              | 0.793         | 0.687         | **0.560** | 0.636        | poprzedni                 |
 | v3     | 2026-11-10 | EfficientNet-B0 | **0.752**          | **0.824**     | **0.732**     | 0.552    | 0.612        | używany w backendzie      |
 | v4     | 2026-11-11 | EfficientNet-B0 | 0.747              | 0.797         | 0.704         | 0.538    | **0.661**    | eksperyment (waga `mel`)  |
+| v5     | 2026-11-11 | EfficientNet-B2 | 0.730              | 0.797         | 0.683         | 0.550    | 0.588        | eksperyment (B2, 260 px)  |
 
 Główna metryka od v2: **balanced accuracy** (średni recall po klasach, oficjalna metryka ISIC
 2018) — według niej trening wybiera checkpoint. Te same liczby w formie do Excela/pandas:
@@ -440,13 +441,152 @@ Czerniak w porównaniu z poprzednimi wersjami:
 
 ---
 
+## v5 — EfficientNet-B2 (260×260, mixed precision)
+
+### Identyfikacja
+
+| | |
+| --- | --- |
+| Plik | `ml/models/efficientnet_b2_ham10000_v5.pt` (state_dict, ~31 MB) |
+| Data treningu | 2026-11-11, 17:48–18:43 (checkpoint zapisany 18:26, po 6. epoce fine-tuningu) |
+| Kod źródłowy | `ml/src/model.py`, `train.py`, `dataloaders.py`, `registry.py` w commicie, który dodał tę sekcję; polecenie: `python -m ml.src.train --version v5` (wartości domyślne) |
+| Status | eksperyment; backend zostaje przy v3 |
+
+### Zmiany względem v3
+
+- **Architektura:** EfficientNet-B2 zamiast B0 (wagi `IMAGENET1K_V1` z torchvision). B2 to B0
+  powiększony w trzech kierunkach („compound scaling”): 23 bloki MBConv zamiast 16, 1408 kanałów
+  na wyjściu zamiast 1280, 9,1 mln parametrów zamiast 5,3 mln.
+- **Rozdzielczość wejścia:** 260×260 zamiast 224×224 (natywna rozdzielczość B2 z publikacji
+  EfficientNet; dotyczy augmentacji treningowej i `Resize` dla val/test).
+- **Mixed precision (AMP):** `torch.autocast` + `GradScaler`. Bez tego B2 nie mieścił się
+  w pamięci GPU (patrz niżej). Wagi i checkpoint zostają 32-bitowe; ewaluacja liczy w 32 bitach.
+
+Bez zmian względem v3: augmentacja, sampler, funkcja straty (`mel_weight=1.0`), optymalizator,
+lr, harmonogram, early stopping, batch size 32, seed 42.
+
+Zmiany techniczne, które nie zmieniają tego, czego model się uczy: ładowanie danych w 2 procesach
+(`num_workers=2`, trening ok. 2,7× szybszy) oraz architektura w nazwie pliku checkpointu.
+
+### Dlaczego mixed precision: pamięć GPU
+
+Maszyna ma GTX 1650 z 4 GB VRAM. Pomiar jednego kroku fine-tuningu (cała sieć odmrożona):
+
+| Model | Rozdzielczość | Batch | AMP | Czas na batch | Szczyt VRAM |
+| --- | --- | --- | --- | --- | --- |
+| B0 | 224 | 32 | nie | 0,26 s | 2,8 GB |
+| B2 | 260 | 32 | nie | 6,30 s | 5,6 GB |
+| B2 | 288 | 32 | nie | 8,89 s | 6,6 GB |
+| B2 | 260 | 16 | nie | 0,28 s | 2,9 GB |
+| **B2** | **260** | **32** | **tak** | **0,56 s** | **2,9 GB** |
+| B2 | 288 | 32 | tak | 1,50 s | 3,4 GB |
+
+Najwięcej pamięci zajmują aktywacje zapisywane na potrzeby przejścia wstecz. Ich rozmiar rośnie
+z głębokością (~1,4×), szerokością (~1,1×) i liczbą pikseli (~1,35×), co daje ~2× (zmierzone
+2,04×). Gdy VRAM się kończy, sterownik NVIDIA na Windowsie przenosi nadmiar do RAM-u, a GPU czyta
+go przez PCIe, stąd ~25× wolniejszy trening. Wybrano AMP przy batch 32 zamiast batch 16, żeby
+batch (i statystyki BatchNorm) zostały takie same jak w v1–v4.
+
+### Trening
+
+Adam, batch size 32. Pełny log epok: `ml/results/training_log.csv` (wiersze z `version=v5`).
+
+| Etap | Co trenowane | lr | Epoki | Najlepsza epoka | Val balanced acc. | Val macro F1 | Val mel recall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 — liniowa sonda | tylko głowica | 1e-3 (stały) | 15 | 9. | 0.588 | 0.431 | 0.277 |
+| 2 — fine-tuning | cała sieć | 1e-4 → cosine | 12 z 30 | 6. | **0.729** | 0.694 | 0.541 |
+
+Jedna epoka trwała ok. 1,2 min w etapie 1 i ok. 2,7 min w etapie 2 (pierwsza ok. 4 min). Cały
+trening ~55 min, mimo większego modelu najkrócej ze wszystkich wersji (AMP + `num_workers`).
+
+W etapie 1 B2 nie miał przewagi nad B0 (v3: 0.609). W fine-tuningu był lepszy od v3 w tych
+samych epokach: w 6. epoce 0.729, więcej niż najlepszy wynik v3 w całym treningu (0.721).
+**Przeuczał się jednak szybciej:** szczyt w 6. epoce (v3: 17.), train balanced accuracy 0.92 →
+0.96 w epokach 6–12, a val spadało do 0.67–0.69. Early stopping zatrzymał trening po 12. epoce.
+Val mel recall wahał się między 0.49 a 0.64.
+
+### Wyniki na zbiorze testowym
+
+Wynik `python -m ml.src.evaluate --version v5` (2026-11-11):
+
+| Klasa | Precision | Recall | F1 | F1 w v3 | Liczba przykładów |
+| --- | --- | --- | --- | --- | --- |
+| akiec | 0.471 | 0.696 | 0.561 | 0.614 | 46 |
+| bcc | 0.585 | 0.775 | 0.667 | 0.726 | 71 |
+| bkl | 0.633 | 0.595 | 0.613 | 0.669 | 168 |
+| df | 0.708 | 0.850 | 0.773 | 0.829 | 20 |
+| **mel** | **0.516** | **0.588** | **0.550** | 0.552 | 165 |
+| nv | 0.931 | 0.872 | 0.901 | 0.920 | 992 |
+| vasc | 0.700 | 0.737 | 0.718 | 0.811 | 19 |
+| **accuracy** | | | **0.797** | 0.824 | 1481 |
+| **macro avg** | 0.649 | 0.730 | **0.683** | 0.732 | 1481 |
+| **balanced accuracy** | | | **0.730** | 0.752 | 1481 |
+| weighted avg | 0.814 | 0.797 | 0.803 | 0.829 | 1481 |
+
+Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
+
+| prawda \ pred | akiec | bcc | bkl | df | mel | nv | vasc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| akiec | **32** | 6 | 4 | 0 | 1 | 3 | 0 |
+| bcc | 6 | **55** | 4 | 1 | 1 | 4 | 0 |
+| bkl | 12 | 8 | **100** | 5 | 23 | 19 | 1 |
+| df | 1 | 1 | 0 | **17** | 0 | 1 | 0 |
+| mel | 10 | 3 | 17 | 1 | **97** | 35 | 2 |
+| nv | 7 | 21 | 33 | 0 | 63 | **865** | 3 |
+| vasc | 0 | 0 | 0 | 0 | 3 | 2 | **14** |
+
+### Wnioski
+
+- **Większy model sam nie poprawił wyniku.** Na teście v5 jest słabszy od v3 we wszystkich
+  głównych metrykach: balanced accuracy 0.730 (v3: 0.752), macro F1 0.683 (v3: 0.732), accuracy
+  0.797 (v3: 0.824). F1 spadło w każdej klasie poza `mel` (praktycznie remis).
+- Czerniak bez poprawy: recall 0.588, a pomyłek `mel` → `nv` jest najwięcej ze wszystkich wersji
+  (35; v3: 33, v4: 26).
+- Najbardziej prawdopodobna przyczyna: za mało danych na większą sieć. 9,1 mln parametrów przy
+  ok. 7 tys. zdjęć treningowych przeucza się szybciej (szczyt w 6. epoce). Do tego ustawienia
+  (lr 1e-4, dropout 0.2, patience 6) dobierano pod B0.
+- Część różnicy to losowość: v3 wypadł na teście wyraźnie lepiej niż na walidacji (0.752 vs
+  0.721), a v5 tak samo na obu (0.730 vs 0.729). Pojedynczy trening na wersję nie pozwala
+  rozstrzygnąć różnic rzędu ±0.02; sprawdzi to walidacja krzyżowa finalnej konfiguracji.
+- Backend zostaje przy v3. Kod B2 + AMP zostaje (`--arch`, `--no-amp`), bo przyda się przy
+  większym zbiorze danych.
+
+### Pomysły na v6
+
+- Więcej danych treningowych: archiwum ISIC (tylko do treningu; usunąć duplikaty HAM10000 i
+  wszystkie zdjęcia z naszego val/test, dopasować klasy). Najpierw na B0 z ustawieniami v3
+  (`--arch efficientnet_b0 --no-amp`), potem ponownie B2, bo większy model może zyskać dopiero
+  przy większym zbiorze.
+- Dla B2: mocniejsza regularyzacja (AdamW z weight decay, większy dropout) albo mniejszy lr.
+- Na koniec bez zmian: walidacja krzyżowa, próg dla `mel`, ewentualnie ensemble.
+
+---
+
 ## Jak dodać nową wersję
 
-Każda wersja ma własny plik `ml/models/efficientnet_b0_ham10000_<wersja>.pt`; trening odmawia
-startu, jeśli plik o tej nazwie już istnieje, więc wcześniejsze modele nigdy nie są nadpisywane.
+Każda wersja ma własny plik `ml/models/<architektura>_ham10000_<wersja>.pt`, np.
+`efficientnet_b0_ham10000_v3.pt` albo `efficientnet_b2_ham10000_v5.pt`. Architektura jest w nazwie,
+bo checkpoint to same wagi: evaluate, Grad-CAM i backend odczytują z nazwy, którą sieć zbudować i
+w jakiej rozdzielczości podawać zdjęcia (B0: 224×224, B2: 260×260; `ml/src/model.py`). Trening
+odmawia startu, jeśli dla tej wersji istnieje już plik (dowolnej architektury), więc wcześniejsze
+modele nigdy nie są nadpisywane.
 
-1. Wytrenuj model: `python -m ml.src.train --version vN`. Log każdej epoki (z kolumną `version`)
-   trafia do `ml/results/training_log.csv`.
+Domyślne ustawienia `train.py` to zawsze ustawienia najnowszej wersji (od v5: EfficientNet-B2,
+260×260, mixed precision). Wcześniejsze wersje odtwarza się flagami:
+
+| Wersja | Polecenie |
+| --- | --- |
+| v1 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-5 --ft-epochs 10 --patience 0 --no-cosine` (bez nowej augmentacji z v3, więc tylko w przybliżeniu) |
+| v2 | `--arch efficientnet_b0 --no-amp` (bez nowej augmentacji z v3, więc tylko w przybliżeniu) |
+| v3 | `--arch efficientnet_b0 --no-amp` |
+| v4 | `--arch efficientnet_b0 --no-amp --mel-weight 2.0` |
+
+Od 2026-11-11 dane ładują 2 procesy w tle (`num_workers=2` w `ml/src/dataloaders.py`, ok. 2,7×
+szybszy trening). Wyniki przy tym samym seedzie są powtarzalne, ale nie identyczne co do bitu z
+treningami v1–v4, które ładowały dane w jednym procesie.
+
+1. Wytrenuj model: `python -m ml.src.train --version vN`. Log każdej epoki (z kolumnami `version`,
+   `arch`, `amp`, `seed`, `mel_weight`) trafia do `ml/results/training_log.csv`.
 2. Oceń go na zbiorze testowym: `python -m ml.src.evaluate --version vN --notes "co się zmieniło"`.
    Wiersz z wynikami trafia do `ml/results/models.csv` (ponowne uruchomienie dla tej samej wersji
    nadpisuje jej wiersz, nie dubluje go).

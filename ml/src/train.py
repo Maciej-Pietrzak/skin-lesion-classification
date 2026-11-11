@@ -1,4 +1,4 @@
-"""Training loop for HAM10000 EfficientNet-B0 transfer learning."""
+"""Training loop for HAM10000 EfficientNet (B0/B2) transfer learning."""
 
 import argparse
 import csv
@@ -13,8 +13,13 @@ from tqdm import tqdm
 from ml.src.dataloaders import get_dataloaders
 from ml.src.dataset import CLASSES
 from ml.src.metrics import compute_metrics
-from ml.src.model import build_model
-from ml.src.registry import MODELS_DIR, RESULTS_DIR, checkpoint_path
+from ml.src.model import ARCHITECTURES, build_model, input_size
+from ml.src.registry import (
+    MODELS_DIR,
+    RESULTS_DIR,
+    checkpoint_path,
+    existing_checkpoints,
+)
 
 # Append-only log of every epoch across every run, so results from different
 # training experiments (hyperparams, architecture tweaks, etc.) can be
@@ -23,6 +28,8 @@ from ml.src.registry import MODELS_DIR, RESULTS_DIR, checkpoint_path
 METRICS_LOG_PATH = RESULTS_DIR / "training_log.csv"
 METRICS_FIELDS = [
     "version",
+    "arch",
+    "amp",
     "seed",
     "mel_weight",
     "timestamp",
@@ -67,7 +74,7 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def build_criterion(mel_weight: float = 2.0) -> nn.CrossEntropyLoss:
+def build_criterion(mel_weight: float = 1.0) -> nn.CrossEntropyLoss:
     """Cross-entropy where errors on true-melanoma images cost mel_weight times
     more than errors on any other class (all others weigh 1.0).
 
@@ -79,8 +86,11 @@ def build_criterion(mel_weight: float = 2.0) -> nn.CrossEntropyLoss:
     test set (33 called nv). The weight applies by TRUE class, so it penalises
     missing a melanoma (mel -> nv), not raising a false alarm (nv -> mel).
 
-    Default (2.0) is v4's setting; v1-v3 trained with mel_weight=1.0, i.e. plain
-    unweighted cross-entropy. val_loss uses the same weights, so it isn't
+    Default 1.0 = plain unweighted cross-entropy (v1-v3, and v5 onwards). Only
+    v4 used 2.0: it raised mel recall but cost overall F1/accuracy, about what
+    a lower mel decision threshold gives without retraining, so later versions
+    tune mel with a threshold instead (see ml/MODELS.md, v4). val_loss uses
+    the same weights, so it isn't
     comparable across different mel_weight values -- the metrics (balanced
     accuracy, F1, mel recall) are.
     """
@@ -89,8 +99,20 @@ def build_criterion(mel_weight: float = 2.0) -> nn.CrossEntropyLoss:
     return nn.CrossEntropyLoss(weight=weights.to(DEVICE))
 
 
-def run_epoch(model, dataloader, criterion, optimizer=None):
-    """One pass over dataloader. Trains if optimizer is given, else evaluates."""
+def run_epoch(model, dataloader, criterion, optimizer=None, scaler=None, amp=False):
+    """One pass over dataloader. Trains if optimizer is given, else evaluates.
+
+    amp = automatic mixed precision: inside torch.autocast most operations run
+    in 16-bit floats instead of 32-bit, which halves the memory taken by the
+    activations every layer keeps for the backward pass. That is what lets
+    EfficientNet-B2 at 260x260 with batch 32 fit in this machine's 4 GB GPU
+    (measured peak: 5.6 GB without amp -> 2.9 GB with it; without it the
+    driver spills into system RAM and a batch takes ~6.3 s instead of ~0.56 s).
+    The weights themselves stay 32-bit, so checkpoints look exactly as before.
+    scaler (GradScaler) multiplies the loss before backward() so that small
+    16-bit gradients don't round down to zero, then un-scales them before the
+    optimizer step. With amp=False both are no-ops (v1-v4 behaviour).
+    """
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
@@ -101,13 +123,15 @@ def run_epoch(model, dataloader, criterion, optimizer=None):
         for imgs, labels in tqdm(dataloader, leave=False):
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
 
-            outputs = model(imgs)
-            loss = criterion(outputs, labels)
+            with torch.autocast(device_type=DEVICE.type, enabled=amp):
+                outputs = model(imgs)
+                loss = criterion(outputs, labels)
 
             if is_train:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
             total_loss += loss.item() * imgs.size(0)
             all_preds.extend(outputs.argmax(dim=1).cpu().tolist())
@@ -125,11 +149,7 @@ def run_training(
     optimizer,
     num_epochs,
     stage,
-    lr,
-    batch_size,
-    version,
-    seed,
-    mel_weight,
+    run_info,
     best_val_bal_acc=0.0,
     scheduler=None,
     patience=None,
@@ -137,6 +157,9 @@ def run_training(
     """Shared epoch loop: trains, validates, checkpoints on val balanced
     accuracy improvement to this version's own checkpoint file, and logs every
     epoch to METRICS_LOG_PATH.
+
+    run_info holds the settings that are fixed for the whole run (version,
+    arch, amp, seed, mel_weight, batch_size); they go into every log row.
 
     best_val_bal_acc lets fine_tune() seed this with stage 1's score, so stage 2
     only overwrites the checkpoint if it actually beats the frozen-backbone model.
@@ -146,12 +169,16 @@ def run_training(
     many epochs in a row -- the model has stopped getting better, so further
     epochs would only cost time (and risk overfitting the train set).
     """
+    amp = run_info["amp"]
+    scaler = torch.amp.GradScaler(DEVICE.type, enabled=amp)
+    ckpt_path = checkpoint_path(run_info["version"], run_info["arch"])
+
     epochs_without_improvement = 0
     for epoch in range(1, num_epochs + 1):
         # LR actually used this epoch (changes each epoch under a scheduler).
         lr = optimizer.param_groups[0]["lr"]
-        train_loss, train_m = run_epoch(model, train_dl, criterion, optimizer)
-        val_loss, val_m = run_epoch(model, val_dl, criterion)
+        train_loss, train_m = run_epoch(model, train_dl, criterion, optimizer, scaler, amp)
+        val_loss, val_m = run_epoch(model, val_dl, criterion, amp=amp)
 
         print(
             f"Epoch {epoch}/{num_epochs} | "
@@ -165,7 +192,7 @@ def run_training(
         is_best = val_m["balanced_accuracy"] > best_val_bal_acc
         if is_best:
             best_val_bal_acc = val_m["balanced_accuracy"]
-            torch.save(model.state_dict(), checkpoint_path(version))
+            torch.save(model.state_dict(), ckpt_path)
             print(f"  -> new best val_bal_acc={best_val_bal_acc:.4f}, saved checkpoint")
             epochs_without_improvement = 0
         else:
@@ -173,15 +200,12 @@ def run_training(
 
         log_metrics_row(
             {
-                "version": version,
-                "seed": seed,
-                "mel_weight": mel_weight,
+                **run_info,
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "stage": stage,
                 "epoch": epoch,
                 "num_epochs": num_epochs,
                 "lr": f"{lr:.2e}",
-                "batch_size": batch_size,
                 "train_loss": f"{train_loss:.4f}",
                 "train_bal_acc": f"{train_m['balanced_accuracy']:.4f}",
                 "train_f1": f"{train_m['macro_f1']:.4f}",
@@ -203,30 +227,45 @@ def run_training(
     return best_val_bal_acc
 
 
+def make_run_info(version, arch, amp, seed, mel_weight, batch_size) -> dict:
+    # amp is only used on CUDA; on a CPU-only machine it is switched off.
+    return {
+        "version": version,
+        "arch": arch,
+        "amp": amp and DEVICE.type == "cuda",
+        "seed": seed,
+        "mel_weight": mel_weight,
+        "batch_size": batch_size,
+    }
+
+
 def train(
     version: str,
+    arch: str = "efficientnet_b2",
+    amp: bool = True,
     seed: int = 42,
     num_epochs: int = 15,
     freeze_backbone: bool = True,
     batch_size: int = 32,
     lr: float = 1e-3,
-    mel_weight: float = 2.0,
+    mel_weight: float = 1.0,
 ):
     """Stage 1: train only the classifier head on top of frozen ImageNet features."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Every version gets its own file, and an existing one is never
     # overwritten -- a typo'd or reused version name would otherwise silently
-    # destroy an earlier model.
-    if checkpoint_path(version).exists():
+    # destroy an earlier model. Checked across all architectures, so the same
+    # version can't exist as both a B0 and a B2 file.
+    if existing_checkpoints(version):
         raise FileExistsError(
-            f"{checkpoint_path(version)} already exists -- pick a new version "
-            f"name (e.g. the next vN) instead of overwriting an earlier model."
+            f"{existing_checkpoints(version)[0]} already exists -- pick a new "
+            f"version name (e.g. the next vN) instead of overwriting an earlier model."
         )
 
     set_seed(seed)
-    train_dl, val_dl, _ = get_dataloaders(batch_size=batch_size)
-    model = build_model(freeze_backbone=freeze_backbone).to(DEVICE)
+    train_dl, val_dl, _ = get_dataloaders(input_size(arch), batch_size=batch_size)
+    model = build_model(arch, freeze_backbone=freeze_backbone).to(DEVICE)
 
     # Only pass trainable params to the optimizer; with freeze_backbone=True
     # that's just the classifier head.
@@ -242,23 +281,21 @@ def train(
         optimizer,
         num_epochs,
         "train",
-        lr,
-        batch_size,
-        version,
-        seed,
-        mel_weight,
+        make_run_info(version, arch, amp, seed, mel_weight, batch_size),
     )
 
 
 def fine_tune(
     version: str,
+    arch: str = "efficientnet_b2",
+    amp: bool = True,
     seed: int = 42,
     num_epochs: int = 30,
     batch_size: int = 32,
     lr: float = 1e-4,
     cosine: bool = True,
     patience: int | None = 6,
-    mel_weight: float = 2.0,
+    mel_weight: float = 1.0,
 ):
     """Stage 2: unfreeze the whole network and keep training from stage 1's
     best weights, at a lower LR than stage 1 (1e-3 -> 1e-4), so the pretrained
@@ -272,11 +309,14 @@ def fine_tune(
     val score stops improving.
     """
     set_seed(seed)
-    train_dl, val_dl, _ = get_dataloaders(batch_size=batch_size)
+    train_dl, val_dl, _ = get_dataloaders(input_size(arch), batch_size=batch_size)
+    run_info = make_run_info(version, arch, amp, seed, mel_weight, batch_size)
 
-    model = build_model(freeze_backbone=False).to(DEVICE)
+    model = build_model(arch, freeze_backbone=False).to(DEVICE)
     # Stage 1 of this same version wrote this file; stage 2 continues from it.
-    model.load_state_dict(torch.load(checkpoint_path(version), map_location=DEVICE))
+    model.load_state_dict(
+        torch.load(checkpoint_path(version, arch), map_location=DEVICE)
+    )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = (
@@ -288,7 +328,7 @@ def fine_tune(
     # Score the stage-1 checkpoint first so stage 2 only overwrites it if
     # fine-tuning actually improves on it.
     criterion = build_criterion(mel_weight)
-    _, stage1_val_m = run_epoch(model, val_dl, criterion)
+    _, stage1_val_m = run_epoch(model, val_dl, criterion, amp=run_info["amp"])
     stage1_val_bal_acc = stage1_val_m["balanced_accuracy"]
     print(f"Stage 1 checkpoint val_bal_acc={stage1_val_bal_acc:.4f} (fine-tuning baseline)")
 
@@ -300,11 +340,7 @@ def fine_tune(
         optimizer,
         num_epochs,
         "fine_tune",
-        lr,
-        batch_size,
-        version,
-        seed,
-        mel_weight,
+        run_info,
         best_val_bal_acc=stage1_val_bal_acc,
         scheduler=scheduler,
         patience=patience,
@@ -316,14 +352,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version",
         required=True,
-        help="name of the new model version, e.g. v2 -> ml/models/efficientnet_b0_ham10000_v2.pt",
+        help="name of the new model version, e.g. v5 -> ml/models/efficientnet_b2_ham10000_v5.pt",
+    )
+    # Defaults = v5 (EfficientNet-B2 at 260x260, mixed precision). v1-v4 were
+    # trained with --arch efficientnet_b0 --no-amp (v4 also --mel-weight 2.0).
+    parser.add_argument("--arch", choices=list(ARCHITECTURES), default="efficientnet_b2")
+    parser.add_argument(
+        "--no-amp", action="store_true", help="train in full 32-bit precision (v1-v4)"
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--mel-weight",
         type=float,
-        default=2.0,
-        help="loss weight for true-mel images (both stages); default = v4, v1-v3 used 1.0",
+        default=1.0,
+        help="loss weight for true-mel images (both stages); 1.0 = unweighted, v4 used 2.0",
     )
     # Fine-tuning (stage 2) settings; defaults = v2. v1's settings were
     # --ft-lr 1e-5 --ft-epochs 10 --patience 0 --no-cosine
@@ -335,11 +377,13 @@ if __name__ == "__main__":
     parser.add_argument("--no-cosine", action="store_true", help="constant LR in stage 2")
     args = parser.parse_args()
 
-    train(args.version, seed=args.seed, mel_weight=args.mel_weight)
+    common = dict(
+        arch=args.arch, amp=not args.no_amp, seed=args.seed, mel_weight=args.mel_weight
+    )
+    train(args.version, **common)
     fine_tune(
         args.version,
-        seed=args.seed,
-        mel_weight=args.mel_weight,
+        **common,
         num_epochs=args.ft_epochs,
         lr=args.ft_lr,
         cosine=not args.no_cosine,

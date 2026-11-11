@@ -72,8 +72,10 @@ pip install -r ml/requirements.txt
 ```
 
 Następnie: `ml/src/download_dataset.py` (pobiera HAM10000 z Kaggle) → `ml/src/split_dataset.py`
-(dzieli po `lesion_id`) → `python -m ml.src.train --version v3` (dwuetapowy trening: liniowa
-sonda, potem fine-tuning; zapisuje checkpoint do `ml/models/efficientnet_b0_ham10000_v3.pt` i log
+(dzieli po `lesion_id`) → `python -m ml.src.train --version v3 --arch efficientnet_b0 --no-amp`
+(dwuetapowy trening: liniowa sonda, potem fine-tuning; bez flag `train.py` trenuje według
+ustawień najnowszej wersji, zob. `ml/MODELS.md`; zapisuje checkpoint do
+`ml/models/efficientnet_b0_ham10000_v3.pt` i log
 epok do `ml/results/training_log.csv`) → `python -m ml.src.evaluate --version v3` (wyniki na
 zbiorze testowym trafiają do `ml/results/models.csv`). Każda wersja ma osobny plik i żaden trening
 nie nadpisuje wcześniejszego modelu; backend używa wersji wskazanej w `MODEL_CHECKPOINT_PATH`

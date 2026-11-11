@@ -10,18 +10,24 @@ from sklearn.metrics import classification_report, confusion_matrix
 from ml.src.dataloaders import get_dataloaders
 from ml.src.dataset import CLASSES
 from ml.src.metrics import compute_metrics
-from ml.src.model import build_model
-from ml.src.registry import DEFAULT_VERSION, checkpoint_path, upsert_model_row
+from ml.src.model import input_size
+from ml.src.registry import (
+    DEFAULT_VERSION,
+    find_checkpoint,
+    load_trained_model,
+    upsert_model_row,
+)
 from ml.src.train import DEVICE
 
 
 def evaluate(version: str = DEFAULT_VERSION, notes: str = ""):
-    _, _, test_dl = get_dataloaders(batch_size=32)
-
-    path = checkpoint_path(version)
-    model = build_model().to(DEVICE)
-    model.load_state_dict(torch.load(path, map_location=DEVICE))
-    model.eval()
+    # Architecture (and with it the input size) comes from the checkpoint's
+    # file name, so this works for B0 and B2 versions alike. Evaluation runs
+    # in full 32-bit precision even for models trained with amp: no gradients
+    # are kept here, so memory isn't an issue.
+    path = find_checkpoint(version)
+    model, arch = load_trained_model(path, DEVICE)
+    _, _, test_dl = get_dataloaders(input_size(arch), batch_size=32)
 
     all_preds, all_labels = [], []
     with torch.no_grad():
