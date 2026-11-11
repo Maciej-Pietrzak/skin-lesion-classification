@@ -37,6 +37,7 @@ METRICS_FIELDS = [
     "epoch",
     "num_epochs",
     "lr",
+    "head_lr",
     "batch_size",
     "train_loss",
     "train_bal_acc",
@@ -176,7 +177,10 @@ def run_training(
     epochs_without_improvement = 0
     for epoch in range(1, num_epochs + 1):
         # LR actually used this epoch (changes each epoch under a scheduler).
+        # Stage 1 has one param group (the head), so lr == head_lr there; in
+        # stage 2 group 0 is the backbone and the last group the head.
         lr = optimizer.param_groups[0]["lr"]
+        head_lr = optimizer.param_groups[-1]["lr"]
         train_loss, train_m = run_epoch(model, train_dl, criterion, optimizer, scaler, amp)
         val_loss, val_m = run_epoch(model, val_dl, criterion, amp=amp)
 
@@ -206,6 +210,7 @@ def run_training(
                 "epoch": epoch,
                 "num_epochs": num_epochs,
                 "lr": f"{lr:.2e}",
+                "head_lr": f"{head_lr:.2e}",
                 "train_loss": f"{train_loss:.4f}",
                 "train_bal_acc": f"{train_m['balanced_accuracy']:.4f}",
                 "train_f1": f"{train_m['macro_f1']:.4f}",
@@ -292,21 +297,30 @@ def fine_tune(
     seed: int = 42,
     num_epochs: int = 30,
     batch_size: int = 32,
-    lr: float = 1e-4,
+    lr: float = 3e-5,
+    head_lr: float | None = 3e-4,
     cosine: bool = True,
     patience: int | None = 6,
     mel_weight: float = 1.0,
 ):
     """Stage 2: unfreeze the whole network and keep training from stage 1's
-    best weights, at a lower LR than stage 1 (1e-3 -> 1e-4), so the pretrained
-    filters get adapted to skin lesions rather than wrecked by large updates.
+    best weights, at a lower LR than stage 1, so the pretrained filters get
+    adapted to skin lesions rather than wrecked by large updates.
 
-    Defaults are v2's settings. v1 used lr=1e-5 for a fixed 10 epochs with no
-    scheduler and no early stopping -- val score was still rising at the end,
-    i.e. it stopped too early and learned too slowly. Cosine annealing lowers
-    the LR smoothly from lr towards 0 over num_epochs: big steps early, fine
-    adjustments at the end. Early stopping (patience) ends training once the
-    val score stops improving.
+    Discriminative learning rates (since v6): lr is for the backbone
+    (model.features), head_lr for the classifier head. The backbone's ImageNet
+    filters are already good and only need gentle adjustment, while the head
+    is new and specific to our 7 classes, so it can move faster. v5 (B2 with a
+    single lr=1e-4) peaked at fine-tune epoch 6 and then overfit quickly -- a
+    sign the backbone was changing too fast. head_lr=None means one lr for the
+    whole network (v2-v5: lr=1e-4 everywhere).
+
+    v1 used lr=1e-5 for a fixed 10 epochs with no scheduler and no early
+    stopping -- val score was still rising at the end, i.e. it stopped too
+    early and learned too slowly. Cosine annealing lowers every group's LR
+    smoothly towards 0 over num_epochs (keeping their 10:1 ratio): big steps
+    early, fine adjustments at the end. Early stopping (patience) ends
+    training once the val score stops improving.
     """
     set_seed(seed)
     train_dl, val_dl, _ = get_dataloaders(input_size(arch), batch_size=batch_size)
@@ -318,7 +332,13 @@ def fine_tune(
         torch.load(checkpoint_path(version, arch), map_location=DEVICE)
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Group 0 = backbone, group 1 = head; run_training logs both groups' LR.
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.features.parameters(), "lr": lr},
+            {"params": model.classifier.parameters(), "lr": head_lr or lr},
+        ]
+    )
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
         if cosine
@@ -354,7 +374,7 @@ if __name__ == "__main__":
         required=True,
         help="name of the new model version, e.g. v5 -> ml/models/efficientnet_b2_ham10000_v5.pt",
     )
-    # Defaults = v5 (EfficientNet-B2 at 260x260, mixed precision). v1-v4 were
+    # Defaults = v6 (EfficientNet-B2 at 260x260, mixed precision). v1-v4 were
     # trained with --arch efficientnet_b0 --no-amp (v4 also --mel-weight 2.0).
     parser.add_argument("--arch", choices=list(ARCHITECTURES), default="efficientnet_b2")
     parser.add_argument(
@@ -367,9 +387,16 @@ if __name__ == "__main__":
         default=1.0,
         help="loss weight for true-mel images (both stages); 1.0 = unweighted, v4 used 2.0",
     )
-    # Fine-tuning (stage 2) settings; defaults = v2. v1's settings were
-    # --ft-lr 1e-5 --ft-epochs 10 --patience 0 --no-cosine
-    parser.add_argument("--ft-lr", type=float, default=1e-4)
+    # Fine-tuning (stage 2) settings; defaults = v6 (discriminative LR).
+    # v2-v5 used one LR for the whole network: --ft-lr 1e-4 --ft-head-lr 0.
+    # v1: --ft-lr 1e-5 --ft-head-lr 0 --ft-epochs 10 --patience 0 --no-cosine
+    parser.add_argument("--ft-lr", type=float, default=3e-5, help="backbone LR in stage 2")
+    parser.add_argument(
+        "--ft-head-lr",
+        type=float,
+        default=3e-4,
+        help="classifier-head LR in stage 2; 0 = same as --ft-lr",
+    )
     parser.add_argument("--ft-epochs", type=int, default=30)
     parser.add_argument(
         "--patience", type=int, default=6, help="early stopping patience, 0 = off"
@@ -386,6 +413,7 @@ if __name__ == "__main__":
         **common,
         num_epochs=args.ft_epochs,
         lr=args.ft_lr,
+        head_lr=args.ft_head_lr or None,
         cosine=not args.no_cosine,
         patience=args.patience or None,
     )

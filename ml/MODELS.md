@@ -12,6 +12,7 @@ Dokumentacja wytrenowanych wersji klasyfikatora zmian skórnych. Same wagi (`ml/
 | v3     | 2026-11-10 | EfficientNet-B0 | **0.752**          | **0.824**     | **0.732**     | 0.552    | 0.612        | używany w backendzie      |
 | v4     | 2026-11-11 | EfficientNet-B0 | 0.747              | 0.797         | 0.704         | 0.538    | **0.661**    | eksperyment (waga `mel`)  |
 | v5     | 2026-11-11 | EfficientNet-B2 | 0.730              | 0.797         | 0.683         | 0.550    | 0.588        | eksperyment (B2, 260 px)  |
+| v6     | 2026-11-11 | EfficientNet-B2 | 0.749              | 0.779         | 0.666         | 0.522    | 0.642        | eksperyment (B2, disc. lr) |
 
 Główna metryka od v2: **balanced accuracy** (średni recall po klasach, oficjalna metryka ISIC
 2018) — według niej trening wybiera checkpoint. Te same liczby w formie do Excela/pandas:
@@ -562,6 +563,126 @@ Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
 
 ---
 
+## v6 — B2 z discriminative learning rate
+
+### Identyfikacja
+
+| | |
+| --- | --- |
+| Plik | `ml/models/efficientnet_b2_ham10000_v6.pt` (state_dict, ~31 MB) |
+| Data treningu | 2026-11-11, 18:52–19:31 (checkpoint zapisany 19:19, po 6. epoce fine-tuningu) |
+| Kod źródłowy | `ml/src/train.py` (`fine_tune()`, grupy parametrów optymalizatora) w commicie, który dodał tę sekcję; polecenie: `python -m ml.src.train --version v6` (wartości domyślne) |
+| Status | eksperyment; backend zostaje przy v3 |
+
+### Zmiany względem v5
+
+Zmieniły się **tylko learning rate'y w fine-tuningu (etap 2)**. Optymalizator ma dwie grupy
+parametrów:
+
+| Grupa | v5 | v6 |
+| --- | --- | --- |
+| backbone (`model.features`) | 1e-4 | **3e-5** |
+| głowica (`model.classifier`) | 1e-4 | **3e-4** |
+
+Cosine annealing zmniejsza oba lr jednocześnie, zachowując proporcję 10:1 (np. w 20. epoce
+8,9e-6 i 8,9e-5). Etap 1, architektura (B2, 260×260, AMP), augmentacja, sampler, strata,
+early stopping i seed są jak w v5.
+
+Uzasadnienie: v5 osiągnął szczyt w 6. epoce fine-tuningu i potem szybko się przeuczał, co
+wskazywało, że backbone zmienia się za szybko. Pretrenowane filtry ImageNet potrzebują
+delikatnych poprawek, a nowa głowica może uczyć się szybciej. Od v6 log ma kolumnę `head_lr`
+(dla starszych wierszy równą `lr`, bo był jeden lr).
+
+### Trening
+
+Adam, batch size 32. Pełny log epok: `ml/results/training_log.csv` (wiersze z `version=v6`).
+
+| Etap | Co trenowane | lr | Epoki | Najlepsza epoka | Val balanced acc. | Val macro F1 | Val mel recall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 — liniowa sonda | tylko głowica | 1e-3 (stały) | 15 | 9. | 0.588 | 0.431 | 0.277 |
+| 2 — fine-tuning | cała sieć | backbone 3e-5, głowica 3e-4 → cosine | 12 z 30 | 6. | **0.720** | 0.670 | 0.588 |
+
+Etap 1 jest identyczny z v5 co do 4. miejsca po przecinku (ten sam kod i seed), więc
+fine-tuning v5 i v6 startuje z tego samego checkpointu. Jedna epoka trwała ok. 53 s w etapie 1
+i ok. 2 min w etapie 2.
+
+Porównanie fine-tuningu v5 i v6 (train / val balanced accuracy):
+
+| Epoka | v5 | v6 |
+| --- | --- | --- |
+| 2 | 0.832 / 0.701 | 0.784 / 0.687 |
+| 6 | 0.922 / **0.729** | 0.862 / **0.720** |
+| 9 | 0.945 / 0.716 | 0.892 / 0.677 |
+| 12 | 0.960 / 0.686 | 0.909 / 0.694 |
+
+**Model wolniej dopasowywał się do zbioru treningowego** (w 12. epoce train 0.91 zamiast 0.96),
+ale szczyt val wypadł w tej samej, 6. epoce i był trochę niższy. Po szczycie val stało w
+przedziale 0.67–0.69. Early stopping zatrzymał trening po 12. epoce.
+
+### Wyniki na zbiorze testowym
+
+Wynik `python -m ml.src.evaluate --version v6` (2026-11-11):
+
+| Klasa | Precision | Recall | F1 | F1 w v5 | F1 w v3 | Liczba przykładów |
+| --- | --- | --- | --- | --- | --- | --- |
+| akiec | 0.492 | 0.652 | 0.561 | 0.561 | 0.614 | 46 |
+| bcc | 0.609 | 0.746 | 0.671 | 0.667 | 0.726 | 71 |
+| bkl | 0.642 | 0.565 | 0.601 | 0.613 | 0.669 | 168 |
+| df | 0.621 | 0.900 | 0.735 | 0.773 | 0.829 | 20 |
+| **mel** | **0.440** | **0.642** | **0.522** | 0.550 | 0.552 | 165 |
+| nv | 0.943 | 0.841 | 0.889 | 0.901 | 0.920 | 992 |
+| vasc | 0.548 | 0.895 | 0.680 | 0.718 | 0.811 | 19 |
+| **accuracy** | | | **0.779** | 0.797 | 0.824 | 1481 |
+| **macro avg** | 0.614 | 0.749 | **0.666** | 0.683 | 0.732 | 1481 |
+| **balanced accuracy** | | | **0.749** | 0.730 | 0.752 | 1481 |
+| weighted avg | 0.814 | 0.779 | 0.790 | 0.803 | 0.829 | 1481 |
+
+Macierz pomyłek (wiersze = klasa prawdziwa, kolumny = predykcja):
+
+| prawda \ pred | akiec | bcc | bkl | df | mel | nv | vasc |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| akiec | **30** | 8 | 3 | 1 | 1 | 2 | 1 |
+| bcc | 5 | **53** | 4 | 4 | 2 | 3 | 0 |
+| bkl | 10 | 8 | **95** | 5 | 30 | 18 | 2 |
+| df | 0 | 0 | 0 | **18** | 1 | 1 | 0 |
+| mel | 10 | 6 | 16 | 1 | **106** | 24 | 2 |
+| nv | 6 | 12 | 30 | 0 | 101 | **834** | 9 |
+| vasc | 0 | 0 | 0 | 0 | 0 | 2 | **17** |
+
+Czerniak w porównaniu z poprzednimi wersjami:
+
+| | v3 | v4 | v5 | v6 |
+| --- | --- | --- | --- | --- |
+| Przeoczone `mel` (ze 165) | 64 | **56** | 68 | 59 |
+| `mel` → `nv` | 33 | 26 | 35 | **24** |
+| Fałszywe alarmy `nv` → `mel` | 64 | 97 | **63** | 101 |
+
+### Wnioski
+
+- **Discriminative lr spowolnił przeuczenie, ale nie poprawił modelu.** Na walidacji v6 jest
+  trochę poniżej v5 (0.720 vs 0.729). Na teście ma wyższą balanced accuracy niż v5 (0.749 vs
+  0.730, prawie jak v3: 0.752), ale najniższe macro F1 (0.666) i accuracy (0.779) od v2.
+- **Wysoki recall przy niskiej precyzji w wielu klasach naraz:** `vasc` recall 0.895 /
+  precyzja 0.548, `df` 0.900 / 0.621, `mel` 0.642 / 0.440. Model częściej wskazuje rzadkie
+  klasy kosztem `nv` (101 znamion uznanych za czerniaka; v3: 64). Balanced accuracy to średni
+  recall, więc takie zachowanie ją podnosi, a macro F1, które uwzględnia precyzję, obniża. Wybór
+  metryki do wyboru checkpointu ma więc realny wpływ na to, jaki model dostajemy, i trzeba
+  patrzeć na kilka metryk naraz.
+- Dwa eksperymenty z B2 (v5, v6) nie pobiły B0 (v3), także po zmianie lr. Najbardziej
+  prawdopodobne ograniczenie to ilość danych (ok. 7 tys. zdjęć treningowych), a nie
+  architektura ani lr.
+- Backend zostaje przy v3: najlepsze macro F1 i accuracy przy praktycznie równej balanced
+  accuracy.
+
+### Pomysły na v7
+
+- Więcej danych treningowych z archiwum ISIC (tylko do treningu; usunąć duplikaty HAM10000 i
+  zdjęcia z naszego val/test, dopasować klasy). Najpierw na B0 z ustawieniami v3, potem
+  ponownie B2.
+- Na koniec bez zmian: walidacja krzyżowa, próg dla `mel`, ewentualnie ensemble.
+
+---
+
 ## Jak dodać nową wersję
 
 Każda wersja ma własny plik `ml/models/<architektura>_ham10000_<wersja>.pt`, np.
@@ -571,15 +692,17 @@ w jakiej rozdzielczości podawać zdjęcia (B0: 224×224, B2: 260×260; `ml/src/
 odmawia startu, jeśli dla tej wersji istnieje już plik (dowolnej architektury), więc wcześniejsze
 modele nigdy nie są nadpisywane.
 
-Domyślne ustawienia `train.py` to zawsze ustawienia najnowszej wersji (od v5: EfficientNet-B2,
-260×260, mixed precision). Wcześniejsze wersje odtwarza się flagami:
+Domyślne ustawienia `train.py` to zawsze ustawienia najnowszej wersji (od v6: EfficientNet-B2,
+260×260, mixed precision, w fine-tuningu lr 3e-5 dla backbone'u i 3e-4 dla głowicy).
+Wcześniejsze wersje odtwarza się flagami:
 
 | Wersja | Polecenie |
 | --- | --- |
-| v1 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-5 --ft-epochs 10 --patience 0 --no-cosine` (bez nowej augmentacji z v3, więc tylko w przybliżeniu) |
-| v2 | `--arch efficientnet_b0 --no-amp` (bez nowej augmentacji z v3, więc tylko w przybliżeniu) |
-| v3 | `--arch efficientnet_b0 --no-amp` |
-| v4 | `--arch efficientnet_b0 --no-amp --mel-weight 2.0` |
+| v1 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-5 --ft-head-lr 0 --ft-epochs 10 --patience 0 --no-cosine` (bez nowej augmentacji z v3, więc tylko w przybliżeniu) |
+| v2 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0` (bez nowej augmentacji z v3, więc tylko w przybliżeniu) |
+| v3 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0` |
+| v4 | `--arch efficientnet_b0 --no-amp --ft-lr 1e-4 --ft-head-lr 0 --mel-weight 2.0` |
+| v5 | `--ft-lr 1e-4 --ft-head-lr 0` |
 
 Od 2026-11-11 dane ładują 2 procesy w tle (`num_workers=2` w `ml/src/dataloaders.py`, ok. 2,7×
 szybszy trening). Wyniki przy tym samym seedzie są powtarzalne, ale nie identyczne co do bitu z
