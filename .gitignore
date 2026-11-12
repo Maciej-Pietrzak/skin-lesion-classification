@@ -38,3 +38,10 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Agent skills (local tooling, not part of the project)
+.agents/
+skills-lock.json
+
+# Raw training stdout/stderr (per-epoch metrics are in ml/results/training_log.csv)
+ml/results/*.log
