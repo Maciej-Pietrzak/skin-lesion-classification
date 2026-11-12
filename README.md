@@ -4,6 +4,36 @@ Praca inżynierska — system wspomagający klasyfikację zmian skórnych na obr
 z wykorzystaniem głębokich sieci neuronowych (transfer learning, EfficientNet), udostępniany
 personelowi medycznemu poprzez aplikację webową.
 
+> ⚠️ Projekt akademicki — **nie jest wyrobem medycznym** i nie służy do diagnozy. Wynik modelu
+> ma charakter wyłącznie pomocniczy.
+
+**Stack:** PyTorch · EfficientNet (torchvision) · Grad-CAM · FastAPI · PostgreSQL · Alembic ·
+React · TypeScript · Vite · Tailwind
+
+## Funkcje
+
+- Klasyfikacja zdjęcia dermatoskopowego do 7 klas HAM10000 (`akiec`, `bcc`, `bkl`, `df`, `mel`,
+  `nv`, `vasc`) z prawdopodobieństwami dla każdej klasy
+- Nakładka **Grad-CAM** pokazująca obszary obrazu, na których model oparł decyzję
+- Historia przypadków (zapis w PostgreSQL): lista, szczegóły, usuwanie
+- Wersjonowane modele z udokumentowaną konfiguracją i wynikami ([`ml/MODELS.md`](ml/MODELS.md))
+
+## Wyniki modelu
+
+Zbiór testowy HAM10000 (1481 zdjęć, podział po `lesion_id`, bez wycieku danych). Główna metryka:
+**balanced accuracy** (średni recall po klasach, oficjalna metryka ISIC 2018).
+
+| Wersja | Architektura    | Balanced acc. | Accuracy | Macro F1 | Recall `mel` | Uwagi                         |
+| ------ | --------------- | ------------- | -------- | -------- | ------------ | ----------------------------- |
+| v1     | EfficientNet-B0 | 0.665         | 0.738    | 0.601    | 0.558        | model bazowy                  |
+| v3     | EfficientNet-B0 | 0.752         | **0.824**| **0.732**| 0.612        | **używany w backendzie**      |
+| v4     | EfficientNet-B0 | 0.747         | 0.797    | 0.704    | **0.661**    | większa waga klasy `mel`      |
+| v7     | EfficientNet-B0 | **0.756**     | 0.780    | 0.695    | 0.636        | native-resolution crop + TTA  |
+
+Pełna lista wersji (v1–v7), konfiguracje treningu, macierze pomyłek i znane słabości (głównie
+rozróżnianie `mel` / `nv`): [`ml/MODELS.md`](ml/MODELS.md), surowe liczby:
+[`ml/results/models.csv`](ml/results/models.csv).
+
 ## Struktura repozytorium
 
 - `ml/` — przygotowanie danych, trening i ewaluacja modelu klasyfikacyjnego (PyTorch)
@@ -100,18 +130,22 @@ npm run dev
 
 ## Status
 
-Projekt w fazie wczesnej implementacji.
+MVP działa end-to-end (upload → predykcja → Grad-CAM → historia). Trwają eksperymenty nad
+poprawą modelu.
 
-- ✅ Dataset (HAM10000, podział po `lesion_id`) i model bazowy (EfficientNet-B0, transfer
-  learning, dwuetapowy trening) — `ml/`
-- ✅ Grad-CAM podłączony do API — każde `POST /predict` zwraca też `gradcam_url` z nakładką
-  pokazującą obszary, na których model oparł decyzję
-- 🔧 Backend (FastAPI + PostgreSQL) — w budowie: `GET /health`, `POST /predict` (inferencja +
-  Grad-CAM + zapis przypadku), `GET/DELETE /cases` (historia przypadków), przesłane zdjęcia i
-  nakładki Grad-CAM serwowane pod `/storage/uploads` i `/storage/gradcam`
+- ✅ Dataset (HAM10000, podział po `lesion_id`) i pipeline treningowy — `ml/`
+- ✅ Model: 7 udokumentowanych wersji (v1–v7), w backendzie v3 — zob. [Wyniki modelu](#wyniki-modelu)
+- ✅ Grad-CAM podłączony do API — każde `POST /predict` zwraca też `gradcam_url`
+- ✅ Backend (FastAPI + PostgreSQL): `GET /health`, `POST /predict` (inferencja + Grad-CAM +
+  zapis przypadku), `GET/DELETE /cases`, pliki pod `/storage/uploads` i `/storage/gradcam`
 - ✅ Frontend (Vite + React + TypeScript + Tailwind) — 3 ekrany MVP: upload + wynik z Grad-CAM
   (`/`), historia przypadków (`/cases`), szczegół przypadku (`/cases/:id`)
-- ⬜ Konteneryzacja (Docker Compose), testy i dokumentacja
+- 🔧 Dalsze eksperymenty z modelem (augmentacja LCA, ważona strata, model finalny na train+val)
+- ⬜ Testy backendu (`backend/tests/` — na razie same szkielety plików)
+- ⬜ Konteneryzacja (Docker Compose)
 
-Aktualna roadmapa: dataset → model bazowy → Grad-CAM → backend → frontend → konteneryzacja →
-testy i dokumentacja.
+## Dane i licencja
+
+Model jest trenowany na zbiorze [HAM10000](https://doi.org/10.7910/DVN/DBW86T) (Tschandl i in.,
+2018), udostępnionym na licencji **CC BY-NC 4.0**, więc wolno go używać tylko niekomercyjnie.
+Zbiór danych ani wagi modeli nie są przechowywane w repozytorium.
